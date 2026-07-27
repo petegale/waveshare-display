@@ -94,7 +94,11 @@ static lv_obj_t* make_tile(lv_obj_t* parent, int idx) {
   lv_obj_set_style_border_width(t, 2, 0);
   lv_obj_set_style_radius(t, 6, 0);
   lv_obj_set_style_pad_all(t, 0, 0);
-  lv_obj_clear_flag(t, LV_OBJ_FLAG_SCROLLABLE);
+  // Base objects are clickable and scrollable by default, and the theme
+  // paints a pressed state — so touching a tile repaints it and reads as
+  // a flicker. This is a readout, not a control: nothing here is meant
+  // to react to touch (yet), so take both flags off.
+  lv_obj_clear_flag(t, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
   return t;
 }
 
@@ -112,7 +116,7 @@ void display_init() {
   lv_obj_set_style_border_side(hdr, LV_BORDER_SIDE_BOTTOM, 0);
   lv_obj_set_style_border_color(hdr, COL_BORDER, 0);
   lv_obj_set_style_pad_all(hdr, 0, 0);
-  lv_obj_clear_flag(hdr, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(hdr, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 
   s_clock = lv_label_create(hdr);
   lv_obj_set_style_text_font(s_clock, &lv_font_montserrat_24, 0);
@@ -138,7 +142,7 @@ void display_init() {
     lv_obj_set_style_bg_color(bar, COL_BORDER, 0);
     lv_obj_set_style_border_width(bar, 0, 0);
     lv_obj_set_style_radius(bar, 0, 0);
-    lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 
     t.label = lv_label_create(bar);
     lv_obj_set_style_text_font(t.label, &lv_font_montserrat_24, 0);

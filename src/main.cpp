@@ -173,6 +173,9 @@ void setup() {
     // 1. Shared I2C bus, then the expander that owns the reset/backlight
     //    lines. Everything else depends on this.
     Wire.begin(I2C_SDA, I2C_SCL);
+    // 400 kHz: the touch controller is polled from the LVGL input
+    // callback, so a slow bus turns into CPU time stolen from rendering.
+    Wire.setClock(400000);
     if (!ch422g_init()) {
         Serial.println("CH422G not responding — check I2C (backlight will stay off)");
     }
@@ -189,14 +192,27 @@ void setup() {
     // 3. Panel.
     lcd.init();
 
-    // 4. LVGL. Draw buffers live in PSRAM (8 MB available); 40 lines each
-    //    is the usual trade-off between flush count and RAM.
+    // 4. LVGL.
+    //
+    // Draw buffers go in INTERNAL DMA RAM, not PSRAM. The RGB panel
+    // streams its framebuffer out of PSRAM continuously; putting the
+    // draw buffers there too makes every redraw contend with the panel
+    // refresh for the same bus, starving the line buffer and showing up
+    // as intermittent flicker. Internal RAM costs us buffer size (20
+    // lines rather than 40) but takes that traffic off PSRAM entirely.
     lv_init();
-    const size_t buf_pixels = SCREEN_WIDTH * 40;
-    buf1 = (lv_color_t *)heap_caps_malloc(buf_pixels * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
-    buf2 = (lv_color_t *)heap_caps_malloc(buf_pixels * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+    const size_t buf_pixels = SCREEN_WIDTH * 20;
+    const size_t buf_bytes  = buf_pixels * sizeof(lv_color_t);
+    buf1 = (lv_color_t *)heap_caps_malloc(buf_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    buf2 = (lv_color_t *)heap_caps_malloc(buf_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
     if (!buf1 || !buf2) {
-        Serial.println("LVGL draw buffer alloc failed — is PSRAM enabled?");
+        // Fall back to PSRAM rather than refusing to boot — a flickery
+        // display still beats a blank one.
+        Serial.println("Internal draw buffers unavailable — falling back to PSRAM");
+        if (buf1) heap_caps_free(buf1);
+        if (buf2) heap_caps_free(buf2);
+        buf1 = (lv_color_t *)heap_caps_malloc(buf_bytes, MALLOC_CAP_SPIRAM);
+        buf2 = (lv_color_t *)heap_caps_malloc(buf_bytes, MALLOC_CAP_SPIRAM);
     }
     lv_disp_draw_buf_init(&draw_buf, buf1, buf2, buf_pixels);
 
