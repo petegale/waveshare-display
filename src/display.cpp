@@ -18,6 +18,7 @@
 
 #include "display.h"
 #include "config.h"
+#include "history.h"
 #include <lvgl.h>
 #include <stdio.h>
 #include <math.h>
@@ -57,6 +58,46 @@ static tile_t   s_tile[N_TILES];
 static lv_obj_t* s_clock;
 static lv_obj_t* s_link;
 
+// ─── Screens ────────────────────────────────────────────────────────────────
+// Two screens rather than show/hide containers: LVGL only renders the
+// loaded screen, so the detail page costs nothing while it's closed.
+static lv_obj_t* s_mainScr   = nullptr;
+static lv_obj_t* s_detailScr = nullptr;
+
+static lv_obj_t*        s_dTitle = nullptr;
+static lv_obj_t*        s_dNow   = nullptr;
+static lv_obj_t*        s_dStats = nullptr;
+static lv_obj_t*        s_dSpan  = nullptr;
+static lv_obj_t*        s_chart  = nullptr;
+static lv_chart_series_t* s_chartSer = nullptr;
+
+// Which metric the detail page is currently showing, or -1 when closed.
+static int s_openTile = -1;
+
+// Last state we rendered — the detail page needs it to redraw on update.
+static display_state_t s_last     = {};
+static bool            s_haveLast = false;
+
+#define CHART_POINTS 120
+
+// Per-tile descriptor: which history metric backs it, and how to print it.
+typedef struct {
+  hist_metric_t metric;
+  const char*   unit;
+  float         scale;      // raw → display units
+  int           decimals;
+  bool          fixedRange;  // percentages pin the Y axis to 0..100
+} tile_desc_t;
+
+static const tile_desc_t TILE_DESC[N_TILES] = {
+  { HIST_TANK0,    "%", 1.0f,  0, true  },
+  { HIST_TANK1,    "%", 1.0f,  0, true  },
+  { HIST_BATT_SOC, "%", 1.0f,  0, true  },
+};
+
+static void open_detail(int tileIdx);
+static void refresh_detail();
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 static const char* fluid_name(uint8_t f) {
   switch (f) {
@@ -94,16 +135,100 @@ static lv_obj_t* make_tile(lv_obj_t* parent, int idx) {
   lv_obj_set_style_border_width(t, 2, 0);
   lv_obj_set_style_radius(t, 6, 0);
   lv_obj_set_style_pad_all(t, 0, 0);
-  // Base objects are clickable and scrollable by default, and the theme
-  // paints a pressed state — so touching a tile repaints it and reads as
-  // a flicker. This is a readout, not a control: nothing here is meant
-  // to react to touch (yet), so take both flags off.
-  lv_obj_clear_flag(t, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+  // Scrolling makes no sense on a fixed tile, but clicking does — each
+  // tile opens its history page. The pressed state below is deliberate
+  // touch feedback (a brighter border), unlike the accidental theme
+  // repaint that used to read as flicker.
+  lv_obj_clear_flag(t, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(t, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_style_border_color(t, COL_FILL, LV_STATE_PRESSED);
+  lv_obj_set_style_bg_color(t, COL_PANEL, LV_STATE_PRESSED);
   return t;
 }
 
+// ─── Formatting helpers ─────────────────────────────────────────────────────
+static void fmt_metric(char* buf, size_t n, int tileIdx, int16_t raw) {
+  const tile_desc_t& d = TILE_DESC[tileIdx];
+  if (raw == HIST_NO_DATA) { snprintf(buf, n, "--"); return; }
+  if (d.decimals == 0) snprintf(buf, n, "%d%s", (int)lroundf(raw * d.scale), d.unit);
+  else                 snprintf(buf, n, "%.*f%s", d.decimals, raw * d.scale, d.unit);
+}
+
+static void tile_clicked(lv_event_t* e) {
+  int idx = (int)(intptr_t)lv_event_get_user_data(e);
+  open_detail(idx);
+}
+
+static void back_clicked(lv_event_t* e) {
+  LV_UNUSED(e);
+  s_openTile = -1;
+  lv_scr_load_anim(s_mainScr, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 180, 0, false);
+}
+
+// ─── Detail screen ──────────────────────────────────────────────────────────
+static void build_detail_screen() {
+  s_detailScr = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(s_detailScr, COL_BG, 0);
+  lv_obj_clear_flag(s_detailScr, LV_OBJ_FLAG_SCROLLABLE);
+
+  s_dTitle = lv_label_create(s_detailScr);
+  lv_obj_set_style_text_font(s_dTitle, &lv_font_montserrat_28, 0);
+  lv_obj_set_style_text_color(s_dTitle, COL_TEXT, 0);
+  lv_label_set_text(s_dTitle, "");
+  lv_obj_align(s_dTitle, LV_ALIGN_TOP_LEFT, 20, 14);
+
+  s_dNow = lv_label_create(s_detailScr);
+  lv_obj_set_style_text_font(s_dNow, &lv_font_montserrat_48, 0);
+  lv_obj_set_style_text_color(s_dNow, COL_TEXT, 0);
+  lv_label_set_text(s_dNow, "--");
+  lv_obj_align(s_dNow, LV_ALIGN_TOP_LEFT, 20, 46);
+
+  s_dStats = lv_label_create(s_detailScr);
+  lv_obj_set_style_text_font(s_dStats, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(s_dStats, COL_DIM, 0);
+  lv_label_set_text(s_dStats, "");
+  lv_obj_align(s_dStats, LV_ALIGN_TOP_LEFT, 200, 60);
+
+  // Back button — generously sized, this gets used with wet hands.
+  lv_obj_t* back = lv_btn_create(s_detailScr);
+  lv_obj_set_size(back, 120, 56);
+  lv_obj_align(back, LV_ALIGN_TOP_RIGHT, -20, 14);
+  lv_obj_set_style_bg_color(back, COL_PANEL, 0);
+  lv_obj_set_style_border_color(back, COL_BORDER, 0);
+  lv_obj_set_style_border_width(back, 2, 0);
+  lv_obj_set_style_border_color(back, COL_FILL, LV_STATE_PRESSED);
+  lv_obj_add_event_cb(back, back_clicked, LV_EVENT_CLICKED, NULL);
+  lv_obj_t* bl = lv_label_create(back);
+  lv_obj_set_style_text_font(bl, &lv_font_montserrat_24, 0);
+  lv_obj_set_style_text_color(bl, COL_TEXT, 0);
+  lv_label_set_text(bl, "BACK");
+  lv_obj_center(bl);
+
+  s_chart = lv_chart_create(s_detailScr);
+  lv_obj_set_size(s_chart, SCREEN_WIDTH - 100, 300);
+  lv_obj_align(s_chart, LV_ALIGN_BOTTOM_MID, 10, -46);
+  lv_chart_set_type(s_chart, LV_CHART_TYPE_LINE);
+  lv_chart_set_point_count(s_chart, CHART_POINTS);
+  lv_chart_set_div_line_count(s_chart, 5, 6);
+  lv_chart_set_update_mode(s_chart, LV_CHART_UPDATE_MODE_SHIFT);
+  lv_obj_set_style_bg_color(s_chart, COL_PANEL, 0);
+  lv_obj_set_style_border_color(s_chart, COL_BORDER, 0);
+  lv_obj_set_style_border_width(s_chart, 2, 0);
+  lv_obj_set_style_line_color(s_chart, COL_BORDER, LV_PART_MAIN);
+  lv_obj_set_style_size(s_chart, 0, LV_PART_INDICATOR);   // no point dots
+  lv_obj_clear_flag(s_chart, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+  s_chartSer = lv_chart_add_series(s_chart, COL_FILL, LV_CHART_AXIS_PRIMARY_Y);
+
+  s_dSpan = lv_label_create(s_detailScr);
+  lv_obj_set_style_text_font(s_dSpan, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(s_dSpan, COL_DIM, 0);
+  lv_label_set_text(s_dSpan, "");
+  lv_obj_align(s_dSpan, LV_ALIGN_BOTTOM_MID, 0, -16);
+}
+
 void display_init() {
-  lv_obj_t* scr = lv_scr_act();
+  s_mainScr = lv_obj_create(NULL);
+  lv_obj_t* scr = s_mainScr;
   lv_obj_set_style_bg_color(scr, COL_BG, 0);
   lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -184,6 +309,9 @@ void display_init() {
     lv_label_set_text(t.badge, "LOW");
     lv_obj_align(t.badge, LV_ALIGN_BOTTOM_MID, 0, -14);
     lv_obj_add_flag(t.badge, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_add_event_cb(t.root, tile_clicked, LV_EVENT_CLICKED,
+                        (void*)(intptr_t)i);
   }
 
   // Scale marks for the battery tile (100 / 75 / 50) — the visual cue
@@ -199,10 +327,105 @@ void display_init() {
     lv_coord_t y = BAR_H + 4 + (barArea - 22) * frac[i] / 100;
     lv_obj_set_pos(m, TILE_W - 44, y);
   }
+
+  build_detail_screen();
+  lv_scr_load(s_mainScr);
+}
+
+// ─── Detail page population ─────────────────────────────────────────────────
+static void open_detail(int tileIdx) {
+  if (tileIdx < 0 || tileIdx >= N_TILES) return;
+  s_openTile = tileIdx;
+  refresh_detail();
+  lv_scr_load_anim(s_detailScr, LV_SCR_LOAD_ANIM_MOVE_LEFT, 180, 0, false);
+}
+
+static void refresh_detail() {
+  if (s_openTile < 0) return;
+  const int idx = s_openTile;
+  const tile_desc_t& d = TILE_DESC[idx];
+  char buf[96];
+
+  // Title mirrors the tile's own label so the two screens agree.
+  lv_label_set_text(s_dTitle, lv_label_get_text(s_tile[idx].label));
+
+  // Current value, straight from the last state rather than the series,
+  // so it matches the tile exactly even mid-bucket.
+  int16_t nowRaw = HIST_NO_DATA;
+  if (s_haveLast) {
+    if (idx < 2) {
+      if (idx < s_last.n_tanks &&
+          s_last.tanks[idx].level_pct != DISPLAY_LEVEL_NO_DATA)
+        nowRaw = s_last.tanks[idx].level_pct;
+    } else if (s_last.batt_soc_pct != DISPLAY_BATT_NO_DATA) {
+      nowRaw = s_last.batt_soc_pct;
+    }
+  }
+  fmt_metric(buf, sizeof(buf), idx, nowRaw);
+  lv_label_set_text(s_dNow, buf);
+
+  // Stats over the stored window.
+  int16_t mn, mx, av;
+  if (history_stats(d.metric, &mn, &mx, &av)) {
+    char sMn[16], sMx[16], sAv[16];
+    fmt_metric(sMn, sizeof(sMn), idx, mn);
+    fmt_metric(sMx, sizeof(sMx), idx, mx);
+    fmt_metric(sAv, sizeof(sAv), idx, av);
+    snprintf(buf, sizeof(buf), "min %s   max %s   avg %s", sMn, sMx, sAv);
+  } else {
+    snprintf(buf, sizeof(buf), "collecting…");
+  }
+  lv_label_set_text(s_dStats, buf);
+
+  // Series.
+  static int16_t pts[CHART_POINTS];
+  int valid = history_series(d.metric, pts, CHART_POINTS);
+
+  if (d.fixedRange) {
+    lv_chart_set_range(s_chart, LV_CHART_AXIS_PRIMARY_Y, 0, 100);
+  } else if (valid > 0) {
+    int16_t lo = INT16_MAX, hi = INT16_MIN;
+    for (int i = 0; i < CHART_POINTS; i++) {
+      if (pts[i] == HIST_NO_DATA) continue;
+      if (pts[i] < lo) lo = pts[i];
+      if (pts[i] > hi) hi = pts[i];
+    }
+    if (hi <= lo) hi = lo + 1;
+    int16_t pad = (hi - lo) / 10 + 1;
+    lv_chart_set_range(s_chart, LV_CHART_AXIS_PRIMARY_Y, lo - pad, hi + pad);
+  }
+
+  for (int i = 0; i < CHART_POINTS; i++) {
+    lv_chart_set_value_by_id(s_chart, s_chartSer, i,
+                             pts[i] == HIST_NO_DATA ? LV_CHART_POINT_NONE
+                                                    : pts[i]);
+  }
+  lv_chart_refresh(s_chart);
+
+  // Time span covered.
+  uint32_t mins = history_span_minutes(d.metric);
+  if (mins < 2)        snprintf(buf, sizeof(buf), "no history yet — one sample per minute");
+  else if (mins < 120) snprintf(buf, sizeof(buf), "last %lu minutes", (unsigned long)mins);
+  else                 snprintf(buf, sizeof(buf), "last %.1f hours", mins / 60.0f);
+  lv_label_set_text(s_dSpan, buf);
 }
 
 void display_update(const display_state_t& state) {
   char buf[40];
+
+  s_last     = state;
+  s_haveLast = true;
+
+  // Feed the series. Metrics with no data this round are simply not fed,
+  // so the bucket records a gap rather than a fabricated zero.
+  for (int i = 0; i < 2; i++) {
+    if (i < state.n_tanks && state.tanks[i].level_pct != DISPLAY_LEVEL_NO_DATA)
+      history_add(i == 0 ? HIST_TANK0 : HIST_TANK1, state.tanks[i].level_pct);
+  }
+  if (state.batt_soc_pct != DISPLAY_BATT_NO_DATA) {
+    history_add(HIST_BATT_SOC, state.batt_soc_pct);
+    history_add(HIST_BATT_CURRENT, state.batt_current_dA);
+  }
 
   // ── Header clock ──
   if (state.utc_days == DISPLAY_UTC_DAYS_NONE) {
@@ -268,6 +491,9 @@ void display_update(const display_state_t& state) {
     lv_obj_set_style_text_color(b.sub, COL_DIM, 0);
     lv_obj_add_flag(b.badge, LV_OBJ_FLAG_HIDDEN);
   }
+
+  // Keep an open history page live rather than frozen at its open time.
+  if (s_openTile >= 0) refresh_detail();
 }
 
 void display_set_link(link_state_t st, uint32_t ageSeconds) {

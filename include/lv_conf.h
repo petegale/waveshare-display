@@ -17,6 +17,8 @@
 #define LV_USE_ARC         1
 #define LV_USE_LABEL       1
 #define LV_USE_BAR         1
+#define LV_USE_CHART       1
+#define LV_USE_BTN         1
 
 // Sizes actually referenced by display.cpp. Each enabled face costs
 // flash, so keep this list in sync rather than enabling the whole range.
