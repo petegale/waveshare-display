@@ -154,6 +154,21 @@ static void fmt_metric(char* buf, size_t n, int tileIdx, int16_t raw) {
   else                 snprintf(buf, n, "%.*f%s", d.decimals, raw * d.scale, d.unit);
 }
 
+// LVGL's base object constructor sets LV_OBJ_FLAG_CLICKABLE, and widgets
+// like lv_bar inherit it without ever using it. A child like the fill bar
+// covers the whole tile body, so it silently swallows taps meant for the
+// tile and nothing happens. Make every child transparent to touch and let
+// the tile root be the only hit target.
+static void children_ignore_touch(lv_obj_t* parent) {
+  uint32_t n = lv_obj_get_child_cnt(parent);
+  for (uint32_t i = 0; i < n; i++) {
+    lv_obj_t* c = lv_obj_get_child(parent, i);
+    if (!c) continue;
+    lv_obj_clear_flag(c, LV_OBJ_FLAG_CLICKABLE);
+    children_ignore_touch(c);          // labels nested in the label bar
+  }
+}
+
 static void tile_clicked(lv_event_t* e) {
   int idx = (int)(intptr_t)lv_event_get_user_data(e);
   open_detail(idx);
@@ -203,6 +218,7 @@ static void build_detail_screen() {
   lv_obj_set_style_text_color(bl, COL_TEXT, 0);
   lv_label_set_text(bl, "BACK");
   lv_obj_center(bl);
+  children_ignore_touch(back);   // same trap: the label must not eat the tap
 
   s_chart = lv_chart_create(s_detailScr);
   lv_obj_set_size(s_chart, SCREEN_WIDTH - 100, 300);
@@ -310,6 +326,9 @@ void display_init() {
     lv_obj_align(t.badge, LV_ALIGN_BOTTOM_MID, 0, -14);
     lv_obj_add_flag(t.badge, LV_OBJ_FLAG_HIDDEN);
 
+    // Must come after every child exists, so nothing is left able to
+    // intercept a tap intended for the tile.
+    children_ignore_touch(t.root);
     lv_obj_add_event_cb(t.root, tile_clicked, LV_EVENT_CLICKED,
                         (void*)(intptr_t)i);
   }
@@ -327,6 +346,9 @@ void display_init() {
     lv_coord_t y = BAR_H + 4 + (barArea - 22) * frac[i] / 100;
     lv_obj_set_pos(m, TILE_W - 44, y);
   }
+  // These marks were added after the tile loop, so re-run the sweep or
+  // they'd be left able to swallow taps on the battery tile.
+  children_ignore_touch(s_tile[2].root);
 
   build_detail_screen();
   lv_scr_load(s_mainScr);
