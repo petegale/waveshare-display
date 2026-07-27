@@ -120,44 +120,56 @@ static void setPeer(const uint8_t* mac, uint8_t ch, const uint8_t* lmk) {
 // ─── Probe ──────────────────────────────────────────────────────────────────
 // Sweeps the channel range looking for the hub, starting at the last known
 // channel so a re-probe after a dropout is usually a single hop.
-static bool probeForHub() {
+//
+// One channel per tick rather than a blocking sweep: at 13 channels ×
+// PROBE_LISTEN_MS a blocking scan would stall lv_timer_handler() for over
+// a second every poll, freezing the UI whenever the hub is unreachable —
+// exactly when the user is most likely to be looking at it.
+static bool     s_scanning   = false;
+static int      s_scanTried  = 0;
+static uint8_t  s_scanCh     = 0;
+static uint32_t s_scanStepAt = 0;
+
+static void scanNextChannel() {
   static const uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
   const int nCh = WIFI_CHANNEL_MAX - WIFI_CHANNEL_MIN + 1;
-  uint8_t start = s_channel ? s_channel : DEFAULT_WIFI_CHANNEL;
 
-  for (int i = 0; i < nCh; i++) {
-    uint8_t ch = WIFI_CHANNEL_MIN + ((start - WIFI_CHANNEL_MIN + i) % nCh);
-    esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
-    setPeer(bcast, ch, nullptr);
-
-    channel_probe_t pkt = {};
-    pkt.magic[0] = PROBE_MAGIC_0;
-    pkt.magic[1] = PROBE_MAGIC_1;
-    pkt.type     = PROBE_TYPE_REQUEST;
-    pkt.channel  = 0;
-
-    s_gotProbe.store(false);
-    esp_now_send(bcast, (const uint8_t*)&pkt, sizeof(pkt));
-
-    uint32_t deadline = millis() + PROBE_LISTEN_MS;
-    while (millis() < deadline) {
-      if (s_gotProbe.load()) {
-        // Lock onto the hub's channel and register it as a peer using the
-        // LMK it just handed us (all-zero → unencrypted link).
-        esp_wifi_set_channel(s_channel, WIFI_SECOND_CHAN_NONE);
-        setPeer(s_hubMac, s_channel, s_hubLmk);
-        s_paired = true;
-        savePairing();
-        Serial.printf("Hub found on ch%d (%02X:%02X:%02X:%02X:%02X:%02X)\n",
-                      s_channel, s_hubMac[0], s_hubMac[1], s_hubMac[2],
-                      s_hubMac[3], s_hubMac[4], s_hubMac[5]);
-        return true;
-      }
-      delay(1);
-    }
+  if (s_scanTried >= nCh) {           // full sweep with no answer
+    s_scanning  = false;
+    s_scanTried = 0;
+    Serial.println("Hub not found on any channel");
+    return;
   }
-  Serial.println("Hub not found on any channel");
-  return false;
+
+  s_scanCh = (s_scanTried == 0)
+             ? (s_channel ? s_channel : DEFAULT_WIFI_CHANNEL)
+             : WIFI_CHANNEL_MIN + ((s_scanCh - WIFI_CHANNEL_MIN + 1) % nCh);
+  s_scanTried++;
+
+  esp_wifi_set_channel(s_scanCh, WIFI_SECOND_CHAN_NONE);
+  setPeer(bcast, s_scanCh, nullptr);
+
+  channel_probe_t pkt = {};
+  pkt.magic[0] = PROBE_MAGIC_0;
+  pkt.magic[1] = PROBE_MAGIC_1;
+  pkt.type     = PROBE_TYPE_REQUEST;
+  pkt.channel  = 0;
+  esp_now_send(bcast, (const uint8_t*)&pkt, sizeof(pkt));
+
+  s_scanStepAt = millis();
+}
+
+// Called from the tick when the RX callback has flagged a probe response.
+static void lockOntoHub() {
+  esp_wifi_set_channel(s_channel, WIFI_SECOND_CHAN_NONE);
+  setPeer(s_hubMac, s_channel, s_hubLmk);
+  s_paired    = true;
+  s_scanning  = false;
+  s_scanTried = 0;
+  savePairing();
+  Serial.printf("Hub found on ch%d (%02X:%02X:%02X:%02X:%02X:%02X)\n",
+                s_channel, s_hubMac[0], s_hubMac[1], s_hubMac[2],
+                s_hubMac[3], s_hubMac[4], s_hubMac[5]);
 }
 
 static void sendRequest() {
@@ -210,15 +222,32 @@ void espnow_tick() {
   // update" age ticking up while the hub is quiet.
   display_set_link(espnow_link_state(), espnow_seconds_since_state());
 
+  // A probe answer can land at any time — including mid-sweep.
+  if (s_gotProbe.exchange(false)) {
+    lockOntoHub();
+    sendRequest();
+    s_lastPollMs = now;
+    return;
+  }
+
+  // Mid-sweep: step to the next channel once this one has had its listen
+  // window, and don't poll until the sweep resolves.
+  if (s_scanning) {
+    if (now - s_scanStepAt >= PROBE_LISTEN_MS) scanNextChannel();
+    return;
+  }
+
   if (now - s_lastPollMs < POLL_INTERVAL_MS) return;
   s_lastPollMs = now;
 
   // Unpaired, or the link has been quiet long enough that the hub may
-  // have hopped channels → probe before polling again.
+  // have hopped channels → start a sweep instead of polling into the void.
   const bool quiet = (s_lastStateMs == 0) ||
                      (now - s_lastStateMs > LINK_TIMEOUT_MS);
   if (!s_paired || quiet) {
-    if (probeForHub()) sendRequest();
+    s_scanning  = true;
+    s_scanTried = 0;
+    scanNextChannel();
     return;
   }
 
