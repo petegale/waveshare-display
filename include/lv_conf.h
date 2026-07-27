@@ -17,8 +17,16 @@
 #define LV_USE_ARC         1
 #define LV_USE_LABEL       1
 #define LV_USE_BAR         1
+
+// Sizes actually referenced by display.cpp. Each enabled face costs
+// flash, so keep this list in sync rather than enabling the whole range.
+#define LV_FONT_MONTSERRAT_14 1
 #define LV_FONT_MONTSERRAT_16 1
+#define LV_FONT_MONTSERRAT_20 1
 #define LV_FONT_MONTSERRAT_24 1
+#define LV_FONT_MONTSERRAT_28 1
+#define LV_FONT_MONTSERRAT_48 1
+
 #define LV_USE_LOG         0
 #define LV_USE_ASSERT_NULL 1
 

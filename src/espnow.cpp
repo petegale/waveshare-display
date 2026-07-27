@@ -1,26 +1,238 @@
+/**
+ * espnow.cpp — see header for the link model.
+ *
+ * Mirrors the proven sensor-display client, minus the deep-sleep power
+ * management: channel probe → probe_response_t (carries the LMK) →
+ * encrypted peer → periodic display_request_t.
+ *
+ * Pairing (hub MAC + LMK) is persisted in NVS so a power cycle doesn't
+ * need the user to re-open pairing mode on the hub. A zero LMK means the
+ * hub asked for an unencrypted link (e.g. the bench simulator).
+ */
+
 #include "espnow.h"
-#include "display_state.h"
+#include "config.h"
 #include "display.h"
+
+#include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
+#include <Preferences.h>
+#include <atomic>
 #include <string.h>
 
-static display_state_t s_display_state;
+static uint8_t  s_hubMac[6]  = {};
+static uint8_t  s_hubLmk[16] = {};
+static bool     s_paired     = false;
+static uint8_t  s_channel    = 0;
 
-static void on_espnow_recv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
-    if (len != sizeof(display_state_t)) return;
-    if (data[1] != DISPLAY_RESP_STATE) return;
+static std::atomic<bool> s_gotProbe{false};
+static std::atomic<bool> s_gotState{false};
+static std::atomic<bool> s_gotUnpair{false};
 
-    memcpy(&s_display_state, data, sizeof(display_state_t));
-    display_update(s_display_state);
+static display_state_t s_state = {};
+static uint32_t s_lastStateMs = 0;
+static uint32_t s_lastPollMs  = 0;
+static uint8_t  s_seq         = 0;
+static bool     s_everUp      = false;
+
+// ─── NVS ────────────────────────────────────────────────────────────────────
+static void loadPairing() {
+  Preferences p;
+  p.begin("display", true);
+  s_paired = p.getBool("paired", false);
+  if (s_paired) {
+    p.getBytes("hubMac", s_hubMac, 6);
+    p.getBytes("hubLmk", s_hubLmk, 16);
+    s_channel = p.getUChar("chan", 0);
+  }
+  p.end();
 }
 
-void espnow_init() {
-    WiFi.mode(WIFI_STA);
+static void savePairing() {
+  Preferences p;
+  p.begin("display", false);
+  p.putBool("paired", true);
+  p.putBytes("hubMac", s_hubMac, 6);
+  p.putBytes("hubLmk", s_hubLmk, 16);
+  p.putUChar("chan", s_channel);
+  p.end();
+}
 
-    if (esp_now_init() != ESP_OK) {
-        return;
+static void clearPairing() {
+  Preferences p;
+  p.begin("display", false);
+  p.clear();
+  p.end();
+  s_paired  = false;
+  s_channel = 0;
+  memset(s_hubMac, 0, 6);
+  memset(s_hubLmk, 0, 16);
+}
+
+// ─── RX (NimBLE-free; runs on the WiFi task) ────────────────────────────────
+static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
+  if (!info || !data) return;
+
+  if (len == (int)sizeof(probe_response_t)) {
+    const probe_response_t* p = (const probe_response_t*)data;
+    if (p->magic[0] != PROBE_MAGIC_0 || p->magic[1] != PROBE_MAGIC_1) return;
+    if (p->type != PROBE_TYPE_RESPONSE) return;
+    memcpy(s_hubMac, info->src_addr, 6);
+    memcpy(s_hubLmk, p->lmk, 16);
+    s_channel = p->channel;
+    s_gotProbe.store(true);
+    return;
+  }
+
+  if (len == (int)sizeof(display_state_t)) {
+    const display_state_t* s = (const display_state_t*)data;
+    if (s->protocol_version != PROTOCOL_VERSION) return;
+    if (s->type != DISPLAY_RESP_STATE) return;
+    memcpy(&s_state, s, sizeof(s_state));
+    s_gotState.store(true);
+    return;
+  }
+
+  if (len == (int)sizeof(hub_response_t)) {
+    const hub_response_t* h = (const hub_response_t*)data;
+    if (h->magic[0] != PROBE_MAGIC_0 || h->magic[1] != PROBE_MAGIC_1) return;
+    if (h->flags & HUB_RESP_FLAG_UNPAIR) s_gotUnpair.store(true);
+    return;
+  }
+}
+
+// ─── Peers ──────────────────────────────────────────────────────────────────
+static void setPeer(const uint8_t* mac, uint8_t ch, const uint8_t* lmk) {
+  if (esp_now_is_peer_exist(mac)) esp_now_del_peer(mac);
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, mac, 6);
+  peer.channel = ch;
+  peer.ifidx   = WIFI_IF_STA;
+  bool hasLmk = false;
+  if (lmk) for (int i = 0; i < 16; i++) if (lmk[i]) { hasLmk = true; break; }
+  peer.encrypt = hasLmk;
+  if (hasLmk) memcpy(peer.lmk, lmk, 16);
+  esp_now_add_peer(&peer);
+}
+
+// ─── Probe ──────────────────────────────────────────────────────────────────
+// Sweeps the channel range looking for the hub, starting at the last known
+// channel so a re-probe after a dropout is usually a single hop.
+static bool probeForHub() {
+  static const uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+  const int nCh = WIFI_CHANNEL_MAX - WIFI_CHANNEL_MIN + 1;
+  uint8_t start = s_channel ? s_channel : DEFAULT_WIFI_CHANNEL;
+
+  for (int i = 0; i < nCh; i++) {
+    uint8_t ch = WIFI_CHANNEL_MIN + ((start - WIFI_CHANNEL_MIN + i) % nCh);
+    esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+    setPeer(bcast, ch, nullptr);
+
+    channel_probe_t pkt = {};
+    pkt.magic[0] = PROBE_MAGIC_0;
+    pkt.magic[1] = PROBE_MAGIC_1;
+    pkt.type     = PROBE_TYPE_REQUEST;
+    pkt.channel  = 0;
+
+    s_gotProbe.store(false);
+    esp_now_send(bcast, (const uint8_t*)&pkt, sizeof(pkt));
+
+    uint32_t deadline = millis() + PROBE_LISTEN_MS;
+    while (millis() < deadline) {
+      if (s_gotProbe.load()) {
+        // Lock onto the hub's channel and register it as a peer using the
+        // LMK it just handed us (all-zero → unencrypted link).
+        esp_wifi_set_channel(s_channel, WIFI_SECOND_CHAN_NONE);
+        setPeer(s_hubMac, s_channel, s_hubLmk);
+        s_paired = true;
+        savePairing();
+        Serial.printf("Hub found on ch%d (%02X:%02X:%02X:%02X:%02X:%02X)\n",
+                      s_channel, s_hubMac[0], s_hubMac[1], s_hubMac[2],
+                      s_hubMac[3], s_hubMac[4], s_hubMac[5]);
+        return true;
+      }
+      delay(1);
     }
+  }
+  Serial.println("Hub not found on any channel");
+  return false;
+}
 
-    esp_now_register_recv_cb(on_espnow_recv);
+static void sendRequest() {
+  display_request_t req = {};
+  req.protocol_version = PROTOCOL_VERSION;
+  req.type             = DISPLAY_REQ_STATE;
+  req.battery_pct      = 100;    // mains powered
+  req.flags            = 0;
+  req.sequence         = s_seq++;
+  req.reserved         = 0;
+  esp_now_send(s_hubMac, (const uint8_t*)&req, sizeof(req));
+}
+
+// ─── Public ─────────────────────────────────────────────────────────────────
+void espnow_init() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    return;
+  }
+  static const uint8_t pmk[16] = ESPNOW_PMK;
+  esp_now_set_pmk(pmk);
+  esp_now_register_recv_cb(onRecv);
+
+  loadPairing();
+  if (s_paired) {
+    if (s_channel) esp_wifi_set_channel(s_channel, WIFI_SECOND_CHAN_NONE);
+    setPeer(s_hubMac, s_channel, s_hubLmk);
+    Serial.printf("Restored pairing from NVS (ch%d)\n", s_channel);
+  }
+}
+
+void espnow_tick() {
+  uint32_t now = millis();
+
+  if (s_gotUnpair.exchange(false)) {
+    Serial.println("UNPAIR received — clearing pairing");
+    clearPairing();
+  }
+
+  if (s_gotState.exchange(false)) {
+    s_lastStateMs = now;
+    s_everUp      = true;
+    display_update(s_state);
+  }
+
+  // Refresh the link banner every tick — cheap, and it keeps the "last
+  // update" age ticking up while the hub is quiet.
+  display_set_link(espnow_link_state(), espnow_seconds_since_state());
+
+  if (now - s_lastPollMs < POLL_INTERVAL_MS) return;
+  s_lastPollMs = now;
+
+  // Unpaired, or the link has been quiet long enough that the hub may
+  // have hopped channels → probe before polling again.
+  const bool quiet = (s_lastStateMs == 0) ||
+                     (now - s_lastStateMs > LINK_TIMEOUT_MS);
+  if (!s_paired || quiet) {
+    if (probeForHub()) sendRequest();
+    return;
+  }
+
+  sendRequest();
+}
+
+link_state_t espnow_link_state() {
+  if (s_lastStateMs == 0) return LINK_SEARCHING;
+  if (millis() - s_lastStateMs > LINK_TIMEOUT_MS)
+    return s_everUp ? LINK_LOST : LINK_SEARCHING;
+  return LINK_UP;
+}
+
+uint32_t espnow_seconds_since_state() {
+  if (s_lastStateMs == 0) return 0;
+  return (millis() - s_lastStateMs) / 1000UL;
 }
