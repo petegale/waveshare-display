@@ -80,6 +80,11 @@ static bool            s_haveLast = false;
 
 #define CHART_POINTS 120
 
+// Backing store handed to LVGL via lv_chart_set_ext_y_array. Populating
+// the series with lv_chart_set_value_by_id() instead would invalidate the
+// whole chart once per point — 120 redraws to draw one line.
+static lv_coord_t s_chartPts[CHART_POINTS];
+
 // Per-tile descriptor: which history metric backs it, and how to print it.
 typedef struct {
   hist_metric_t metric;
@@ -174,10 +179,14 @@ static void tile_clicked(lv_event_t* e) {
   open_detail(idx);
 }
 
+// Screen switches are instant, not animated. A slide forces a full
+// 800x480 repaint per animation frame — ~768 kB of pixel traffic each,
+// which this panel cannot sustain and which showed up as a stutter. An
+// instrument panel wants an immediate response anyway.
 static void back_clicked(lv_event_t* e) {
   LV_UNUSED(e);
   s_openTile = -1;
-  lv_scr_load_anim(s_mainScr, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 180, 0, false);
+  lv_scr_load(s_mainScr);
 }
 
 // ─── Detail screen ──────────────────────────────────────────────────────────
@@ -234,6 +243,8 @@ static void build_detail_screen() {
   lv_obj_set_style_size(s_chart, 0, LV_PART_INDICATOR);   // no point dots
   lv_obj_clear_flag(s_chart, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
   s_chartSer = lv_chart_add_series(s_chart, COL_FILL, LV_CHART_AXIS_PRIMARY_Y);
+  for (int i = 0; i < CHART_POINTS; i++) s_chartPts[i] = LV_CHART_POINT_NONE;
+  lv_chart_set_ext_y_array(s_chart, s_chartSer, s_chartPts);
 
   s_dSpan = lv_label_create(s_detailScr);
   lv_obj_set_style_text_font(s_dSpan, &lv_font_montserrat_16, 0);
@@ -359,7 +370,7 @@ static void open_detail(int tileIdx) {
   if (tileIdx < 0 || tileIdx >= N_TILES) return;
   s_openTile = tileIdx;
   refresh_detail();
-  lv_scr_load_anim(s_detailScr, LV_SCR_LOAD_ANIM_MOVE_LEFT, 180, 0, false);
+  lv_scr_load(s_detailScr);
 }
 
 static void refresh_detail() {
@@ -417,10 +428,11 @@ static void refresh_detail() {
     lv_chart_set_range(s_chart, LV_CHART_AXIS_PRIMARY_Y, lo - pad, hi + pad);
   }
 
+  // Write straight into the array LVGL is already pointing at, then
+  // invalidate once.
   for (int i = 0; i < CHART_POINTS; i++) {
-    lv_chart_set_value_by_id(s_chart, s_chartSer, i,
-                             pts[i] == HIST_NO_DATA ? LV_CHART_POINT_NONE
-                                                    : pts[i]);
+    s_chartPts[i] = (pts[i] == HIST_NO_DATA) ? LV_CHART_POINT_NONE
+                                             : (lv_coord_t)pts[i];
   }
   lv_chart_refresh(s_chart);
 

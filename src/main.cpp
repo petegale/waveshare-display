@@ -199,10 +199,14 @@ void setup() {
     // streams its framebuffer out of PSRAM continuously; putting the
     // draw buffers there too makes every redraw contend with the panel
     // refresh for the same bus, starving the line buffer and showing up
-    // as intermittent flicker. Internal RAM costs us buffer size (20
-    // lines rather than 40) but takes that traffic off PSRAM entirely.
+    // as intermittent flicker.
+    //
+    // 32 lines is the most we can take from internal RAM while leaving
+    // comfortable headroom for the WiFi stack. Each flush carries fixed
+    // overhead, so bigger chunks mean a full-screen repaint costs 15
+    // flushes rather than 24.
     lv_init();
-    const size_t buf_pixels = SCREEN_WIDTH * 20;
+    const size_t buf_pixels = SCREEN_WIDTH * 32;
     const size_t buf_bytes  = buf_pixels * sizeof(lv_color_t);
     buf1 = (lv_color_t *)heap_caps_malloc(buf_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
     buf2 = (lv_color_t *)heap_caps_malloc(buf_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
@@ -244,5 +248,8 @@ void loop() {
     lv_timer_handler();
     espnow_tick();
     history_tick();
-    delay(5);
+    // 1 ms rather than 5: during a full-screen repaint the renderer wants
+    // every slice of CPU it can get, and both ticks below are cheap
+    // no-ops between their intervals.
+    delay(1);
 }
