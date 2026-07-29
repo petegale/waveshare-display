@@ -19,6 +19,8 @@
 #include "display.h"
 #include "config.h"
 #include "history.h"
+#include "espnow.h"          // hub history queries
+#include "remote_protocol.h"  // HIST_METRIC_*, HIST_WINDOW_*
 #include <lvgl.h>
 #include <stdio.h>
 #include <math.h>
@@ -70,6 +72,8 @@ static lv_obj_t*        s_dStats = nullptr;
 static lv_obj_t*        s_dSpan  = nullptr;
 static lv_obj_t*        s_chart  = nullptr;
 static lv_chart_series_t* s_chartSer = nullptr;
+static lv_obj_t* s_winBtn = nullptr;
+static lv_obj_t* s_winLbl = nullptr;
 
 // Which metric the detail page is currently showing, or -1 when closed.
 static int s_openTile = -1;
@@ -92,16 +96,32 @@ typedef struct {
   float         scale;      // raw → display units
   int           decimals;
   bool          fixedRange;  // percentages pin the Y axis to 0..100
+  uint8_t       hubMetric;   // HIST_METRIC_* — what to ask the hub for
 } tile_desc_t;
 
 static const tile_desc_t TILE_DESC[N_TILES] = {
-  { HIST_TANK0,    "%", 1.0f,  0, true  },
-  { HIST_TANK1,    "%", 1.0f,  0, true  },
-  { HIST_BATT_SOC, "%", 1.0f,  0, true  },
+  { HIST_TANK0,    "%", 1.0f,  0, true, HIST_METRIC_TANK0    },
+  { HIST_TANK1,    "%", 1.0f,  0, true, HIST_METRIC_TANK1    },
+  { HIST_BATT_SOC, "%", 1.0f,  0, true, HIST_METRIC_BATT_SOC },
 };
+
+// Which window the detail page is showing. The hub keeps 24 h / 30 d / 1 y;
+// this node's own rings only reach 24 h, and are the fallback when the link
+// is down — so the longer windows are only offered when the hub answers.
+static uint8_t s_window = HIST_WINDOW_24H;
+static bool    s_usingHub = false;
+
+static const char* window_name(uint8_t w) {
+  switch (w) {
+    case HIST_WINDOW_30D: return "30 DAYS";
+    case HIST_WINDOW_1Y:  return "1 YEAR";
+    default:              return "24 HOURS";
+  }
+}
 
 static void open_detail(int tileIdx);
 static void refresh_detail();
+static void cycle_window(lv_event_t* e);
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 static const char* fluid_name(uint8_t f) {
@@ -228,6 +248,23 @@ static void build_detail_screen() {
   lv_label_set_text(bl, "BACK");
   lv_obj_center(bl);
   children_ignore_touch(back);   // same trap: the label must not eat the tap
+
+  // Window selector, left of BACK. Same construction and the same
+  // children_ignore_touch trap.
+  s_winBtn = lv_btn_create(s_detailScr);
+  lv_obj_set_size(s_winBtn, 190, 56);
+  lv_obj_align(s_winBtn, LV_ALIGN_TOP_RIGHT, -152, 14);
+  lv_obj_set_style_bg_color(s_winBtn, COL_PANEL, 0);
+  lv_obj_set_style_border_color(s_winBtn, COL_BORDER, 0);
+  lv_obj_set_style_border_width(s_winBtn, 2, 0);
+  lv_obj_set_style_border_color(s_winBtn, COL_FILL, LV_STATE_PRESSED);
+  lv_obj_add_event_cb(s_winBtn, cycle_window, LV_EVENT_CLICKED, NULL);
+  s_winLbl = lv_label_create(s_winBtn);
+  lv_obj_set_style_text_font(s_winLbl, &lv_font_montserrat_24, 0);
+  lv_obj_set_style_text_color(s_winLbl, COL_TEXT, 0);
+  lv_label_set_text(s_winLbl, window_name(s_window));
+  lv_obj_center(s_winLbl);
+  children_ignore_touch(s_winBtn);
 
   s_chart = lv_chart_create(s_detailScr);
   lv_obj_set_size(s_chart, SCREEN_WIDTH - 100, 300);
@@ -369,8 +406,24 @@ void display_init() {
 static void open_detail(int tileIdx) {
   if (tileIdx < 0 || tileIdx >= N_TILES) return;
   s_openTile = tileIdx;
+  // Ask the hub as the page opens. The reply is asynchronous, so the first
+  // paint shows the local series and the hub's supersedes it a moment later
+  // — better than a blank chart while a round trip completes.
+  espnow_history_request(TILE_DESC[tileIdx].hubMetric, s_window, CHART_POINTS);
   refresh_detail();
   lv_scr_load(s_detailScr);
+}
+
+// Cycle 24 h → 30 d → 1 y. One button rather than three: the detail page is
+// already full, and the label always says which window is showing.
+static void cycle_window(lv_event_t* e) {
+  (void)e;
+  s_window = (s_window == HIST_WINDOW_24H) ? HIST_WINDOW_30D
+           : (s_window == HIST_WINDOW_30D) ? HIST_WINDOW_1Y
+                                           : HIST_WINDOW_24H;
+  if (s_openTile >= 0)
+    espnow_history_request(TILE_DESC[s_openTile].hubMetric, s_window, CHART_POINTS);
+  if (s_winLbl) lv_label_set_text(s_winLbl, window_name(s_window));
 }
 
 static void refresh_detail() {
@@ -410,9 +463,28 @@ static void refresh_detail() {
   }
   lv_label_set_text(s_dStats, buf);
 
-  // Series.
+  // Series: hub first, local rings as the fallback. The hub's series is
+  // longer, survives reboots, and is the same data the PWA shows; the local
+  // one is what this node still has when the link is down.
   static int16_t pts[CHART_POINTS];
-  int valid = history_series(d.metric, pts, CHART_POINTS);
+  int valid = 0;
+  s_usingHub = false;
+  if (espnow_history_ready()) {
+    int n = espnow_history_values(pts, CHART_POINTS);
+    if (n > 0) {
+      // Right-align a short series so the newest point stays at the right
+      // edge rather than the chart appearing to run backwards in time.
+      if (n < CHART_POINTS) {
+        int shift = CHART_POINTS - n;
+        for (int i = CHART_POINTS - 1; i >= shift; i--) pts[i] = pts[i - shift];
+        for (int i = 0; i < shift; i++) pts[i] = HIST_NO_DATA;
+      }
+      for (int i = 0; i < CHART_POINTS; i++)
+        if (pts[i] != HIST_NO_DATA) valid++;
+      s_usingHub = true;
+    }
+  }
+  if (!s_usingHub) valid = history_series(d.metric, pts, CHART_POINTS);
 
   if (d.fixedRange) {
     lv_chart_set_range(s_chart, LV_CHART_AXIS_PRIMARY_Y, 0, 100);
@@ -436,11 +508,16 @@ static void refresh_detail() {
   }
   lv_chart_refresh(s_chart);
 
-  // Time span covered.
-  uint32_t mins = history_span_minutes(d.metric);
-  if (mins < 2)        snprintf(buf, sizeof(buf), "no history yet — one sample per minute");
-  else if (mins < 120) snprintf(buf, sizeof(buf), "last %lu minutes", (unsigned long)mins);
-  else                 snprintf(buf, sizeof(buf), "last %.1f hours", mins / 60.0f);
+  // Time span covered, and where it came from — a chart that silently falls
+  // back to a shorter local series would otherwise look like data loss.
+  if (s_usingHub) {
+    snprintf(buf, sizeof(buf), "%s · from hub", window_name(s_window));
+  } else {
+    uint32_t mins = history_span_minutes(d.metric);
+    if (mins < 2)        snprintf(buf, sizeof(buf), "no history yet — one sample per minute");
+    else if (mins < 120) snprintf(buf, sizeof(buf), "last %lu minutes (local)", (unsigned long)mins);
+    else                 snprintf(buf, sizeof(buf), "last %.1f hours (local)", mins / 60.0f);
+  }
   lv_label_set_text(s_dSpan, buf);
 }
 

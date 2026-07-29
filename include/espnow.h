@@ -30,3 +30,23 @@ link_state_t espnow_link_state();
 
 // Seconds since the last state response (0 if never).
 uint32_t espnow_seconds_since_state();
+
+// ─── Hub history ────────────────────────────────────────────────────────────
+// The hub keeps far more than this node can: 24 h at one minute, 30 days at
+// 15 minutes and a year at the hour, persisted across reboots. The local
+// rings in history.h stay as the fallback — they are what the display has
+// when the link is down, and they survive nothing but they cost nothing.
+
+// Ask the hub for a series. Fire and forget; the reply lands asynchronously
+// and espnow_history_ready() goes true.
+void espnow_history_request(uint8_t metricIdx, uint8_t window, uint8_t nPoints);
+
+// True once a response for the most recent request has arrived.
+bool espnow_history_ready();
+
+// Copy the last response's points into out[] as real values, oldest first,
+// with HIST_NO_DATA for gaps. Returns the number written.
+int espnow_history_values(int16_t* out, int maxOut);
+
+// Seconds each returned point represents, for the time axis.
+uint16_t espnow_history_interval_s();

@@ -11,6 +11,7 @@
  */
 
 #include "espnow.h"
+#include "history.h"
 #include "config.h"
 #include "display.h"
 
@@ -32,6 +33,13 @@ static std::atomic<bool> s_gotState{false};
 static std::atomic<bool> s_gotUnpair{false};
 
 static display_state_t s_state = {};
+
+// Last history response, and whether it is newer than the last request.
+// One in flight at a time: the UI shows one chart, and a second request
+// simply supersedes the first.
+static history_response_t s_hist = {};
+static volatile bool      s_histReady = false;
+static uint8_t            s_histSeq = 0;
 static uint32_t s_lastStateMs = 0;
 static uint32_t s_lastPollMs  = 0;
 static uint8_t  s_seq         = 0;
@@ -92,6 +100,15 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
     if (s->type != DISPLAY_RESP_STATE) return;
     memcpy(&s_state, s, sizeof(s_state));
     s_gotState.store(true);
+    return;
+  }
+
+  if (len == (int)sizeof(history_response_t)) {
+    const history_response_t* h = (const history_response_t*)data;
+    if (h->magic[0] != PROBE_MAGIC_0 || h->magic[1] != PROBE_MAGIC_1) return;
+    if (h->type != HIST_MSG_RESPONSE) return;
+    memcpy(&s_hist, h, sizeof(s_hist));
+    s_histReady = true;
     return;
   }
 
@@ -264,4 +281,39 @@ link_state_t espnow_link_state() {
 uint32_t espnow_seconds_since_state() {
   if (s_lastStateMs == 0) return 0;
   return (millis() - s_lastStateMs) / 1000UL;
+}
+
+
+// ─── Hub history ────────────────────────────────────────────────────────────
+void espnow_history_request(uint8_t metricIdx, uint8_t window, uint8_t nPoints) {
+  if (espnow_link_state() != LINK_UP) return;
+  s_histReady = false;
+  history_request_t req = {};
+  req.magic[0]   = PROBE_MAGIC_0;
+  req.magic[1]   = PROBE_MAGIC_1;
+  req.type       = HIST_MSG_REQUEST;
+  req.metric_idx = metricIdx;
+  req.window     = window;
+  req.n_points   = nPoints;
+  req.sequence   = ++s_histSeq;
+  esp_now_send(s_hubMac, (const uint8_t*)&req, sizeof(req));
+}
+
+bool espnow_history_ready() { return s_histReady; }
+
+uint16_t espnow_history_interval_s() { return s_hist.interval_s; }
+
+int espnow_history_values(int16_t* out, int maxOut) {
+  if (!s_histReady || !out) return 0;
+  int n = s_hist.n_points;
+  if (n > maxOut) n = maxOut;
+  for (int i = 0; i < n; i++) {
+    uint8_t p = s_hist.points[i];
+    // The hub sends normalised bytes against the min/max in the header;
+    // 0xFF is the gap marker and must not be scaled into a real value.
+    out[i] = (p == HISTORY_POINT_GAP)
+           ? HIST_NO_DATA
+           : history_point_to_value(p, s_hist.v_min, s_hist.v_max);
+  }
+  return n;
 }
