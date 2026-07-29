@@ -18,7 +18,6 @@
 
 #include "display.h"
 #include "config.h"
-#include "history.h"
 #include "espnow.h"          // hub history queries
 #include "remote_protocol.h"  // HIST_METRIC_*, HIST_WINDOW_*
 #include <lvgl.h>
@@ -91,7 +90,6 @@ static lv_coord_t s_chartPts[CHART_POINTS];
 
 // Per-tile descriptor: which history metric backs it, and how to print it.
 typedef struct {
-  hist_metric_t metric;
   const char*   unit;
   float         scale;      // raw → display units
   int           decimals;
@@ -100,14 +98,34 @@ typedef struct {
 } tile_desc_t;
 
 static const tile_desc_t TILE_DESC[N_TILES] = {
-  { HIST_TANK0,    "%", 1.0f,  0, true, HIST_METRIC_TANK0    },
-  { HIST_TANK1,    "%", 1.0f,  0, true, HIST_METRIC_TANK1    },
-  { HIST_BATT_SOC, "%", 1.0f,  0, true, HIST_METRIC_BATT_SOC },
+  { "%", 1.0f, 0, true, HIST_METRIC_TANK0    },
+  { "%", 1.0f, 0, true, HIST_METRIC_TANK1    },
+  { "%", 1.0f, 0, true, HIST_METRIC_BATT_SOC },
 };
 
 // Which window the detail page is showing. The hub keeps 24 h / 30 d / 1 y;
 // this node's own rings only reach 24 h, and are the fallback when the link
 // is down — so the longer windows are only offered when the hub answers.
+// Chart series, filled from the hub's response. Sized to the chart so
+// refresh_detail() and statsOf() work from exactly what is drawn.
+static int16_t s_pts[CHART_POINTS];
+
+// Min / max / mean over the drawn series, gaps excluded. False if there is
+// nothing real in it.
+static bool statsOf(const int16_t* p, int n, int16_t* mn, int16_t* mx, int16_t* av) {
+  int32_t sum = 0; int cnt = 0;
+  for (int i = 0; i < n; i++) {
+    if (p[i] == HIST_NO_DATA) continue;
+    if (!cnt) { *mn = *mx = p[i]; }
+    if (p[i] < *mn) *mn = p[i];
+    if (p[i] > *mx) *mx = p[i];
+    sum += p[i]; cnt++;
+  }
+  if (!cnt) return false;
+  *av = (int16_t)(sum / cnt);
+  return true;
+}
+
 static uint8_t s_window = HIST_WINDOW_24H;
 static bool    s_usingHub = false;
 
@@ -450,9 +468,11 @@ static void refresh_detail() {
   fmt_metric(buf, sizeof(buf), idx, nowRaw);
   lv_label_set_text(s_dNow, buf);
 
-  // Stats over the stored window.
+  // Stats over whatever is on screen. Computed from the hub series below
+  // rather than kept separately, so the numbers always describe the chart
+  // the user is actually looking at.
   int16_t mn, mx, av;
-  if (history_stats(d.metric, &mn, &mx, &av)) {
+  if (statsOf(s_pts, CHART_POINTS, &mn, &mx, &av)) {
     char sMn[16], sMx[16], sAv[16];
     fmt_metric(sMn, sizeof(sMn), idx, mn);
     fmt_metric(sMx, sizeof(sMx), idx, mx);
@@ -463,28 +483,31 @@ static void refresh_detail() {
   }
   lv_label_set_text(s_dStats, buf);
 
-  // Series: hub first, local rings as the fallback. The hub's series is
-  // longer, survives reboots, and is the same data the PWA shows; the local
-  // one is what this node still has when the link is down.
-  static int16_t pts[CHART_POINTS];
+  // Series comes from the hub, and only from the hub. This node kept its own
+  // rings for a while, which meant two different answers to the same question
+  // depending on which one happened to have data — and the local one reset on
+  // every power cut. The hub's series is persisted, longer, and the same data
+  // the PWA shows. When the link is down there is no history, and the page
+  // says so rather than quietly showing a shorter different series.
   int valid = 0;
   s_usingHub = false;
+  for (int i = 0; i < CHART_POINTS; i++) s_pts[i] = HIST_NO_DATA;
   if (espnow_history_ready()) {
-    int n = espnow_history_values(pts, CHART_POINTS);
+    int n = espnow_history_values(s_pts, CHART_POINTS);
     if (n > 0) {
       // Right-align a short series so the newest point stays at the right
       // edge rather than the chart appearing to run backwards in time.
       if (n < CHART_POINTS) {
         int shift = CHART_POINTS - n;
-        for (int i = CHART_POINTS - 1; i >= shift; i--) pts[i] = pts[i - shift];
-        for (int i = 0; i < shift; i++) pts[i] = HIST_NO_DATA;
+        for (int i = CHART_POINTS - 1; i >= shift; i--) s_pts[i] = s_pts[i - shift];
+        for (int i = 0; i < shift; i++) s_pts[i] = HIST_NO_DATA;
       }
       for (int i = 0; i < CHART_POINTS; i++)
-        if (pts[i] != HIST_NO_DATA) valid++;
+        if (s_pts[i] != HIST_NO_DATA) valid++;
       s_usingHub = true;
     }
   }
-  if (!s_usingHub) valid = history_series(d.metric, pts, CHART_POINTS);
+  int16_t* pts = s_pts;
 
   if (d.fixedRange) {
     lv_chart_set_range(s_chart, LV_CHART_AXIS_PRIMARY_Y, 0, 100);
@@ -511,12 +534,13 @@ static void refresh_detail() {
   // Time span covered, and where it came from — a chart that silently falls
   // back to a shorter local series would otherwise look like data loss.
   if (s_usingHub) {
-    snprintf(buf, sizeof(buf), "%s · from hub", window_name(s_window));
+    snprintf(buf, sizeof(buf), "%s", window_name(s_window));
+  } else if (espnow_link_state() == LINK_UP) {
+    snprintf(buf, sizeof(buf), "%s — waiting for the hub", window_name(s_window));
   } else {
-    uint32_t mins = history_span_minutes(d.metric);
-    if (mins < 2)        snprintf(buf, sizeof(buf), "no history yet — one sample per minute");
-    else if (mins < 120) snprintf(buf, sizeof(buf), "last %lu minutes (local)", (unsigned long)mins);
-    else                 snprintf(buf, sizeof(buf), "last %.1f hours (local)", mins / 60.0f);
+    // No link, so no history. Said plainly rather than shown as an empty
+    // chart the user has to interpret.
+    snprintf(buf, sizeof(buf), "no hub connection — history unavailable");
   }
   lv_label_set_text(s_dSpan, buf);
 }
@@ -526,17 +550,6 @@ void display_update(const display_state_t& state) {
 
   s_last     = state;
   s_haveLast = true;
-
-  // Feed the series. Metrics with no data this round are simply not fed,
-  // so the bucket records a gap rather than a fabricated zero.
-  for (int i = 0; i < 2; i++) {
-    if (i < state.n_tanks && state.tanks[i].level_pct != DISPLAY_LEVEL_NO_DATA)
-      history_add(i == 0 ? HIST_TANK0 : HIST_TANK1, state.tanks[i].level_pct);
-  }
-  if (state.batt_soc_pct != DISPLAY_BATT_NO_DATA) {
-    history_add(HIST_BATT_SOC, state.batt_soc_pct);
-    history_add(HIST_BATT_CURRENT, state.batt_current_dA);
-  }
 
   // ── Header clock ──
   if (state.utc_days == DISPLAY_UTC_DAYS_NONE) {

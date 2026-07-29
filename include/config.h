@@ -1,4 +1,12 @@
 #pragma once
+#include <stdint.h>
+
+// Gap marker in a chart series. History itself lives on the hub — this node
+// keeps none of its own — but the display still needs to know which points
+// carry no reading so it can break the line rather than draw through an
+// outage.
+#define HIST_NO_DATA  INT16_MIN
+
 
 /**
  * Waveshare ESP32-S3-Touch-LCD-4.3B pin map.

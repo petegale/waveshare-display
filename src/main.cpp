@@ -24,7 +24,6 @@
 #include "ch422g.h"
 #include "display.h"
 #include "espnow.h"
-#include "history.h"
 
 class LGFX : public lgfx::LGFX_Device {
     lgfx::Panel_RGB _panel;
@@ -235,7 +234,6 @@ void setup() {
 
     // 5. Build the UI and draw it once *before* the backlight comes on,
     //    so the first thing the user sees is the finished screen.
-    history_init();
     display_init();
     lv_timer_handler();
     ch422g_backlight(true);
@@ -247,7 +245,6 @@ void setup() {
 void loop() {
     lv_timer_handler();
     espnow_tick();
-    history_tick();
     // 1 ms rather than 5: during a full-screen repaint the renderer wants
     // every slice of CPU it can get, and both ticks below are cheap
     // no-ops between their intervals.
