@@ -72,7 +72,6 @@ static lv_obj_t* s_mainScr   = nullptr;
 static lv_obj_t* s_detailScr = nullptr;
 
 static lv_obj_t*        s_dTitle = nullptr;
-static lv_obj_t*        s_dNow   = nullptr;
 static lv_obj_t*        s_loading = nullptr;
 static lv_obj_t*        s_dSpan  = nullptr;
 static lv_obj_t*        s_chart  = nullptr;
@@ -103,6 +102,13 @@ static bool            s_haveLast = false;
 // the chart is what the page exists for, so it takes it.
 #define CHART_H      344
 #define CHART_BOTTOM 52
+
+// Width is what remains once BOTH label columns and a margin come out. The
+// chart was previously sized from the screen and nudged right, which pushed
+// the right-hand label column past the edge of the panel: the rate axis was
+// drawn but clipped, which is worse than not drawing it.
+#define CHART_MARGIN 16
+#define CHART_W      (SCREEN_WIDTH - 2 * (AXIS_LABEL_W + CHART_MARGIN))
 
 // Backing store handed to LVGL via lv_chart_set_ext_y_array. Populating
 // the series with lv_chart_set_value_by_id() instead would invalidate the
@@ -250,8 +256,26 @@ static void bucket_when(char* out, size_t n, int idx, int count) {
 static void chart_pressed(lv_event_t* e) {
   (void)e;
   if (s_openTile < 0 || !s_probe) return;
-  uint16_t id = lv_chart_get_pressed_point(s_chart);
-  if (id == LV_CHART_POINT_NONE || (int)id >= s_pointCount) return;
+
+  // Column under the finger, from the touch coordinate rather than LVGL's
+  // pressed-point. lv_chart_get_pressed_point() latches on the press and does
+  // not follow a finger dragged across the chart, so reading a second column
+  // meant lifting off and tapping again — the chart is a strip of values and
+  // scrubbing along it is the obvious way to read them.
+  lv_indev_t* indev = lv_indev_get_act();
+  if (!indev) return;
+  lv_point_t pt;
+  lv_indev_get_point(indev, &pt);
+
+  lv_coord_t x0   = s_chart->coords.x1 + PLOT_INSET;
+  lv_coord_t plotW = lv_obj_get_width(s_chart) - 2 * PLOT_INSET;
+  if (plotW <= 0 || s_pointCount <= 0) return;
+
+  int32_t rel = pt.x - x0;
+  if (rel < 0) rel = 0;
+  if (rel >= plotW) rel = plotW - 1;
+  uint16_t id = (uint16_t)((rel * s_pointCount) / plotW);
+  if ((int)id >= s_pointCount) id = (uint16_t)(s_pointCount - 1);
   if (s_pts[id] == HIST_NO_DATA) {
     lv_label_set_text(s_probe, "#B4B4B4 no data for this bucket#");
     lv_obj_clear_flag(s_probe, LV_OBJ_FLAG_HIDDEN);
@@ -411,15 +435,11 @@ static void build_detail_screen() {
   lv_label_set_text(s_dTitle, "");
   lv_obj_align(s_dTitle, LV_ALIGN_TOP_LEFT, 20, 30);
 
-  s_dNow = lv_label_create(s_detailScr);
-  lv_obj_set_style_text_font(s_dNow, &lv_font_montserrat_48, 0);
-  lv_obj_set_style_text_color(s_dNow, COL_TEXT, 0);
-  lv_label_set_text(s_dNow, "--");
-  // Beside the name rather than under it. Stacking them cost a whole line of
-  // vertical space to say one thing, and the chart is what the page is for.
-  // Aligned to the title's own right edge so it follows "WATER" and
-  // "HOUSE BATTERY" alike without a hand-tuned offset per metric.
-  lv_obj_align_to(s_dNow, s_dTitle, LV_ALIGN_OUT_RIGHT_MID, 18, -2);
+  // Current level removed from this header. It was positioned with
+  // lv_obj_align_to(), which resolves once — and it ran while the title was
+  // still empty, so it anchored to a zero-width label and never moved when
+  // the name arrived, printing the two on top of each other. The value is on
+  // the tile the user just came from, and every column here is a value.
 
   // s_dStats removed: a single summary number beside a chart the user can
   // now interrogate directly was one more thing to reconcile, not less.
@@ -458,8 +478,8 @@ static void build_detail_screen() {
   children_ignore_touch(s_winBtn);
 
   s_chart = lv_chart_create(s_detailScr);
-  lv_obj_set_size(s_chart, SCREEN_WIDTH - 100, CHART_H);
-  lv_obj_align(s_chart, LV_ALIGN_BOTTOM_MID, 10, -CHART_BOTTOM);
+  lv_obj_set_size(s_chart, CHART_W, CHART_H);
+  lv_obj_align(s_chart, LV_ALIGN_BOTTOM_MID, 0, -CHART_BOTTOM);
   lv_chart_set_type(s_chart, LV_CHART_TYPE_BAR);
   lv_chart_set_point_count(s_chart, CHART_POINTS);
   lv_chart_set_div_line_count(s_chart, 5, 6);
@@ -488,6 +508,10 @@ static void build_detail_screen() {
   lv_obj_add_event_cb(s_chart, chart_pressed, LV_EVENT_PRESSED, NULL);
   lv_obj_add_event_cb(s_chart, chart_released, LV_EVENT_RELEASED, NULL);
   lv_obj_add_event_cb(s_chart, chart_released, LV_EVENT_PRESS_LOST, NULL);
+  // A horizontal drag would otherwise be interpreted as a scroll gesture and
+  // bubble to the screen, cancelling the press mid-scrub.
+  lv_obj_clear_flag(s_chart, LV_OBJ_FLAG_GESTURE_BUBBLE);
+  lv_obj_clear_flag(s_chart, LV_OBJ_FLAG_SCROLL_CHAIN);
   // Recolour the pressed bar as it is drawn. LVGL has no per-point colour for
   // a bar series, so the draw hook is the only way to give the column itself
   // a pressed state — and the column is what the finger is on, so the column
@@ -504,8 +528,8 @@ static void build_detail_screen() {
   // and its litres-per-hour have nothing in common but the time axis. This is
   // the same split Victron uses for voltage against current.
   s_rateChart = lv_chart_create(s_detailScr);
-  lv_obj_set_size(s_rateChart, SCREEN_WIDTH - 100, CHART_H);
-  lv_obj_align(s_rateChart, LV_ALIGN_BOTTOM_MID, 10, -CHART_BOTTOM);
+  lv_obj_set_size(s_rateChart, CHART_W, CHART_H);
+  lv_obj_align(s_rateChart, LV_ALIGN_BOTTOM_MID, 0, -CHART_BOTTOM);
   lv_chart_set_type(s_rateChart, LV_CHART_TYPE_LINE);
   lv_chart_set_point_count(s_rateChart, CHART_POINTS);
   lv_chart_set_div_line_count(s_rateChart, 0, 0);
@@ -532,14 +556,14 @@ static void build_detail_screen() {
   lv_chart_set_ext_y_array(s_rateChart, s_rateSer, s_ratePts);
 
   // A single status, centred on the plot. There were two before — a
-  // "collecting…" beside the title and a "waiting for the hub" along the
+  // "collecting" beside the title and a "waiting for the hub" along the
   // bottom — which said the same thing twice, in two places, neither of them
   // where the user was looking for the data.
   s_loading = lv_label_create(s_detailScr);
   lv_obj_set_style_text_font(s_loading, &lv_font_montserrat_28, 0);
   lv_obj_set_style_text_color(s_loading, COL_DIM, 0);
   lv_obj_align(s_loading, LV_ALIGN_CENTER, 0, 20);
-  lv_label_set_text(s_loading, "Loading…");
+  lv_label_set_text(s_loading, "Loading");
 
   // Touch readout. Averages answer "typically"; this answers "that column",
   // which is the question actually being asked of a chart whose interesting
@@ -695,7 +719,7 @@ static void open_detail(int tileIdx) {
   // — better than a blank chart while a round trip completes.
   set_point_count(points_for_window(s_window));
   if (s_loading) {
-    lv_label_set_text(s_loading, "Loading…");
+    lv_label_set_text(s_loading, "Loading");
     lv_obj_clear_flag(s_loading, LV_OBJ_FLAG_HIDDEN);
   }
   espnow_history_request(TILE_DESC[tileIdx].hubMetric, s_window,
@@ -737,20 +761,6 @@ static void refresh_detail() {
   // Title mirrors the tile's own label so the two screens agree.
   lv_label_set_text(s_dTitle, lv_label_get_text(s_tile[idx].label));
 
-  // Current value, straight from the last state rather than the series,
-  // so it matches the tile exactly even mid-bucket.
-  int16_t nowRaw = HIST_NO_DATA;
-  if (s_haveLast) {
-    if (idx < 2) {
-      if (idx < s_last.n_tanks &&
-          s_last.tanks[idx].level_pct != DISPLAY_LEVEL_NO_DATA)
-        nowRaw = s_last.tanks[idx].level_pct;
-    } else if (s_last.batt_soc_pct != DISPLAY_BATT_NO_DATA) {
-      nowRaw = s_last.batt_soc_pct;
-    }
-  }
-  fmt_metric(buf, sizeof(buf), idx, nowRaw);
-  lv_label_set_text(s_dNow, buf);
 
   // Stats over whatever is on screen. Computed from the hub series below
   // rather than kept separately, so the numbers always describe the chart
@@ -879,7 +889,7 @@ static void refresh_detail() {
   } else {
     const bool linkUp = (espnow_link_state() == LINK_UP);
     lv_obj_set_style_text_color(s_loading, linkUp ? COL_DIM : COL_ALARM, 0);
-    lv_label_set_text(s_loading, linkUp ? "Loading…" : "No hub connection");
+    lv_label_set_text(s_loading, linkUp ? "Loading" : "No hub connection");
     lv_obj_clear_flag(s_loading, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(s_legend, "");
   }
