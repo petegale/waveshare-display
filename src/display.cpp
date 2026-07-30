@@ -165,6 +165,7 @@ static const char* bucket_name(uint8_t w) {
 // Points currently on the charts. Both charts are resized together so the
 // rate line stays registered with the columns it belongs to.
 static int s_pointCount = 24;
+static bool s_statsPending = false;
 
 static void set_point_count(int n) {
   s_pointCount = n;
@@ -334,6 +335,11 @@ static void build_detail_screen() {
   lv_chart_set_type(s_chart, LV_CHART_TYPE_BAR);
   lv_chart_set_point_count(s_chart, CHART_POINTS);
   lv_chart_set_div_line_count(s_chart, 5, 6);
+  // Numbered Y axis: the grid alone gave no way to read a bar as a value.
+  lv_chart_set_axis_tick(s_chart, LV_CHART_AXIS_PRIMARY_Y, 6, 0, 5, 1, true, 60);
+  lv_obj_set_style_text_font(s_chart, &lv_font_montserrat_20, LV_PART_TICKS);
+  lv_obj_set_style_text_color(s_chart, COL_DIM, LV_PART_TICKS);
+  lv_obj_set_style_pad_left(s_chart, 8, LV_PART_MAIN);
   lv_chart_set_update_mode(s_chart, LV_CHART_UPDATE_MODE_SHIFT);
   lv_obj_set_style_bg_color(s_chart, COL_PANEL, 0);
   lv_obj_set_style_border_color(s_chart, COL_BORDER, 0);
@@ -372,11 +378,15 @@ static void build_detail_screen() {
   lv_obj_align(s_legend, LV_ALIGN_BOTTOM_LEFT, 20, -18);
   lv_label_set_text(s_legend, "");
 
+  // s_dSpan removed: it sat at BOTTOM_MID under a legend anchored
+  // BOTTOM_LEFT, and a legend long enough to be useful ran straight through
+  // it. The window button already names the window, so the only thing worth
+  // keeping was the link status, which now rides on the legend line.
   s_dSpan = lv_label_create(s_detailScr);
   lv_obj_set_style_text_font(s_dSpan, &lv_font_montserrat_20, 0);
   lv_obj_set_style_text_color(s_dSpan, COL_DIM, 0);
   lv_label_set_text(s_dSpan, "");
-  lv_obj_align(s_dSpan, LV_ALIGN_BOTTOM_MID, 0, -16);
+  lv_obj_add_flag(s_dSpan, LV_OBJ_FLAG_HIDDEN);
 }
 
 void display_init() {
@@ -556,17 +566,12 @@ static void refresh_detail() {
   // Stats over whatever is on screen. Computed from the hub series below
   // rather than kept separately, so the numbers always describe the chart
   // the user is actually looking at.
-  int16_t mn, mx, av;
-  if (statsOf(s_pts, s_pointCount, &mn, &mx, &av)) {
-    char sMn[16], sMx[16], sAv[16];
-    fmt_metric(sMn, sizeof(sMn), idx, mn);
-    fmt_metric(sMx, sizeof(sMx), idx, mx);
-    fmt_metric(sAv, sizeof(sAv), idx, av);
-    snprintf(buf, sizeof(buf), "min %s   max %s   avg %s", sMn, sMx, sAv);
-  } else {
-    snprintf(buf, sizeof(buf), "collecting…");
-  }
-  lv_label_set_text(s_dStats, buf);
+  // Deliberately not min/max/avg of the level. Max is "however full it was
+  // when last filled" and the average level of a tank that gets refilled is a
+  // number with no physical meaning — both are already visible in the bars.
+  // What the bars do not state is the figure the chart exists to answer:
+  // how much per day. That is computed below, once the series is in hand.
+  s_statsPending = true;
 
   // Series comes from the hub, and only from the hub. This node kept its own
   // rings for a while, which meant two different answers to the same question
@@ -649,7 +654,12 @@ static void refresh_detail() {
     int16_t mag = (rateHi > -rateLo ? rateHi : -rateLo);
     if (mag < 10) mag = 10;
     lv_chart_set_range(s_rateChart, LV_CHART_AXIS_PRIMARY_Y, -mag, mag);
-    const char* rUnit = (idx < 2 && s_tankCapacityL[idx] > 0) ? "L/h" : "%/h";
+    // Per bucket, not per hour — the rate is scaled to the column width, so
+    // labelling it /h on a day-per-column view stated the wrong quantity
+    // while showing the right number.
+    const char* rBase = (idx < 2 && s_tankCapacityL[idx] > 0) ? "L" : "%";
+    char rUnit[16];
+    snprintf(rUnit, sizeof(rUnit), "%s/%s", rBase, bucket_name(s_window));
     char lbuf[72];
     snprintf(lbuf, sizeof(lbuf),
              "#4A9EFF bars# level %% per %s    #FFB020 line# rate %s (max %.1f)",
@@ -659,6 +669,30 @@ static void refresh_detail() {
   } else {
     lv_label_set_text(s_legend, "");
   }
+  // Stats worth having: the lowest the level reached, and the mean rate over
+  // the window — "how much water do we use per day", stated rather than
+  // estimated off a line.
+  if (s_statsPending) {
+    s_statsPending = false;
+    int16_t mn, mx, av;
+    if (statsOf(pts, s_pointCount, &mn, &mx, &av) && haveRate) {
+      int32_t rsum = 0; int rn = 0;
+      for (int i = 0; i < s_pointCount; i++) {
+        if (s_ratePts[i] == LV_CHART_POINT_NONE) continue;
+        rsum += s_ratePts[i]; rn++;
+      }
+      char sMn[16];
+      fmt_metric(sMn, sizeof(sMn), idx, mn);
+      const char* uBase = (idx < 2 && s_tankCapacityL[idx] > 0) ? "L" : "%";
+      float meanRate = rn ? (float)rsum / (float)rn / 10.0f : 0.0f;
+      snprintf(buf, sizeof(buf), "low %s    %+.1f %s/%s avg",
+               sMn, meanRate, uBase, bucket_name(s_window));
+    } else {
+      snprintf(buf, sizeof(buf), "collecting…");
+    }
+    lv_label_set_text(s_dStats, buf);
+  }
+
   lv_chart_refresh(s_rateChart);
 
   // Write straight into the array LVGL is already pointing at, then
@@ -671,16 +705,13 @@ static void refresh_detail() {
 
   // Time span covered, and where it came from — a chart that silently falls
   // back to a shorter local series would otherwise look like data loss.
-  if (s_usingHub) {
-    snprintf(buf, sizeof(buf), "%s", window_name(s_window));
-  } else if (espnow_link_state() == LINK_UP) {
-    snprintf(buf, sizeof(buf), "%s — waiting for the hub", window_name(s_window));
-  } else {
-    // No link, so no history. Said plainly rather than shown as an empty
-    // chart the user has to interpret.
-    snprintf(buf, sizeof(buf), "no hub connection — history unavailable");
+  if (!s_usingHub) {
+    lv_label_set_recolor(s_legend, true);
+    lv_label_set_text(s_legend,
+      (espnow_link_state() == LINK_UP)
+        ? "#B4B4B4 waiting for the hub#"
+        : "#FF4D4D no hub connection — history unavailable#");
   }
-  lv_label_set_text(s_dSpan, buf);
 }
 
 void display_update(const display_state_t& state) {
