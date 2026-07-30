@@ -166,6 +166,55 @@ static const char* bucket_name(uint8_t w) {
 // rate line stays registered with the columns it belongs to.
 static int s_pointCount = 24;
 static bool s_statsPending = false;
+static lv_obj_t* s_probe = nullptr;
+
+static void fmt_metric(char* buf, size_t n, int tileIdx, int16_t raw);
+
+// How far back a column sits, in its own unit — "6 days ago" reads better
+// than an index, and the newest column is at the right.
+static void bucket_age(char* out, size_t n, int idx, int count) {
+  int back = (count - 1) - idx;
+  if (back <= 0) { snprintf(out, n, "now"); return; }
+  snprintf(out, n, "%d %s%s ago", back, bucket_name(s_window),
+           back == 1 ? "" : "s");
+}
+
+static void chart_pressed(lv_event_t* e) {
+  (void)e;
+  if (s_openTile < 0 || !s_probe) return;
+  uint16_t id = lv_chart_get_pressed_point(s_chart);
+  if (id == LV_CHART_POINT_NONE || (int)id >= s_pointCount) return;
+  if (s_pts[id] == HIST_NO_DATA) {
+    lv_label_set_text(s_probe, "#B4B4B4 no data for this bucket#");
+    lv_obj_clear_flag(s_probe, LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
+
+  char age[32], val[16];
+  bucket_age(age, sizeof(age), id, s_pointCount);
+  fmt_metric(val, sizeof(val), s_openTile, s_pts[id]);
+
+  // Show the level and, when this bucket has one, its own rate — the figure
+  // an average over the window cannot give you.
+  char line[96];
+  if (s_ratePts[id] != LV_CHART_POINT_NONE) {
+    const char* uBase = (s_openTile < 2 && s_tankCapacityL[s_openTile] > 0)
+                      ? "L" : "%";
+    float r = (float)s_ratePts[id] / 10.0f;
+    snprintf(line, sizeof(line), "#F2F2F2 %s#  #4A9EFF %s#   #FFB020 %+.1f %s/%s#",
+             age, val, r, uBase, bucket_name(s_window));
+  } else {
+    snprintf(line, sizeof(line), "#F2F2F2 %s#  #4A9EFF %s#", age, val);
+  }
+  lv_label_set_text(s_probe, line);
+  lv_obj_clear_flag(s_probe, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void chart_released(lv_event_t* e) {
+  (void)e;
+  // Left up on release rather than cleared: lifting a finger to read the
+  // number should not take the number away.
+}
 
 static void set_point_count(int n) {
   s_pointCount = n;
@@ -185,6 +234,8 @@ static const char* window_name(uint8_t w) {
 static void open_detail(int tileIdx);
 static void refresh_detail();
 static void cycle_window(lv_event_t* e);
+static void chart_pressed(lv_event_t* e);
+static void chart_released(lv_event_t* e);
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 static const char* fluid_name(uint8_t f) {
@@ -346,7 +397,13 @@ static void build_detail_screen() {
   lv_obj_set_style_border_width(s_chart, 2, 0);
   lv_obj_set_style_line_color(s_chart, COL_BORDER, LV_PART_MAIN);
   lv_obj_set_style_size(s_chart, 0, LV_PART_INDICATOR);   // no point dots
-  lv_obj_clear_flag(s_chart, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+  // Clickable so a column can be interrogated. Scrolling stays off — a drag
+  // is a read, not a pan.
+  lv_obj_clear_flag(s_chart, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(s_chart, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(s_chart, chart_pressed, LV_EVENT_PRESSING, NULL);
+  lv_obj_add_event_cb(s_chart, chart_pressed, LV_EVENT_PRESSED, NULL);
+  lv_obj_add_event_cb(s_chart, chart_released, LV_EVENT_RELEASED, NULL);
   s_chartSer = lv_chart_add_series(s_chart, COL_FILL, LV_CHART_AXIS_PRIMARY_Y);
   for (int i = 0; i < CHART_POINTS; i++) s_chartPts[i] = LV_CHART_POINT_NONE;
   lv_chart_set_ext_y_array(s_chart, s_chartSer, s_chartPts);
@@ -370,6 +427,21 @@ static void build_detail_screen() {
   s_rateSer = lv_chart_add_series(s_rateChart, COL_WARN, LV_CHART_AXIS_PRIMARY_Y);
   for (int i = 0; i < CHART_POINTS; i++) s_ratePts[i] = LV_CHART_POINT_NONE;
   lv_chart_set_ext_y_array(s_rateChart, s_rateSer, s_ratePts);
+
+  // Touch readout. Averages answer "typically"; this answers "that column",
+  // which is the question actually being asked of a chart whose interesting
+  // days are the ones that differ from the average.
+  s_probe = lv_label_create(s_detailScr);
+  lv_obj_set_style_text_font(s_probe, &lv_font_montserrat_24, 0);
+  lv_obj_set_style_text_color(s_probe, COL_TEXT, 0);
+  lv_obj_set_style_bg_color(s_probe, COL_PANEL, 0);
+  lv_obj_set_style_bg_opa(s_probe, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_color(s_probe, COL_FILL, 0);
+  lv_obj_set_style_border_width(s_probe, 2, 0);
+  lv_obj_set_style_pad_all(s_probe, 8, 0);
+  lv_obj_align(s_probe, LV_ALIGN_TOP_MID, 0, 96);
+  lv_obj_add_flag(s_probe, LV_OBJ_FLAG_HIDDEN);
+  lv_label_set_recolor(s_probe, true);
 
   // Legend, so the two colours are not a guess.
   s_legend = lv_label_create(s_detailScr);
@@ -676,17 +748,38 @@ static void refresh_detail() {
     s_statsPending = false;
     int16_t mn, mx, av;
     if (statsOf(pts, s_pointCount, &mn, &mx, &av) && haveRate) {
+      // Average only the buckets where something was actually drawn down.
+      //
+      // A flat mean over the whole window is worse than no figure: water sits
+      // untouched all week and is used hard at the weekend, so averaging the
+      // idle days in reports a consumption nobody has ever experienced. Rises
+      // are excluded too — a refill is not negative consumption.
+      //
+      // The threshold is a twentieth of the largest single-bucket draw, which
+      // scales with the metric instead of assuming litres or percent, and
+      // keeps sensor jitter from counting as a day aboard.
+      int32_t worst = 0;
+      for (int i = 0; i < s_pointCount; i++) {
+        if (s_ratePts[i] == LV_CHART_POINT_NONE) continue;
+        if (s_ratePts[i] < worst) worst = s_ratePts[i];
+      }
+      int32_t thresh = worst / 20;          // negative
       int32_t rsum = 0; int rn = 0;
       for (int i = 0; i < s_pointCount; i++) {
         if (s_ratePts[i] == LV_CHART_POINT_NONE) continue;
+        if (s_ratePts[i] >= thresh) continue;   // idle, or a refill
         rsum += s_ratePts[i]; rn++;
       }
       char sMn[16];
       fmt_metric(sMn, sizeof(sMn), idx, mn);
       const char* uBase = (idx < 2 && s_tankCapacityL[idx] > 0) ? "L" : "%";
-      float meanRate = rn ? (float)rsum / (float)rn / 10.0f : 0.0f;
-      snprintf(buf, sizeof(buf), "low %s    %+.1f %s/%s avg",
-               sMn, meanRate, uBase, bucket_name(s_window));
+      if (rn) {
+        float useRate = -(float)rsum / (float)rn / 10.0f;
+        snprintf(buf, sizeof(buf), "low %s    %.1f %s per active %s  (%d of %d)",
+                 sMn, useRate, uBase, bucket_name(s_window), rn, s_pointCount);
+      } else {
+        snprintf(buf, sizeof(buf), "low %s    no use in this window", sMn);
+      }
     } else {
       snprintf(buf, sizeof(buf), "collecting…");
     }
