@@ -141,6 +141,36 @@ static bool statsOf(const int16_t* p, int n, int16_t* mn, int16_t* mx, int16_t* 
 }
 
 static uint8_t s_window = HIST_WINDOW_24H;
+
+// One column per next unit down from the window: hours across a day, days
+// across a month, months across a year. The hub averages each bucket, so a
+// column is a real mean over that unit rather than a sample plucked from it —
+// and at 12–30 columns each one is wide enough to read, which 120 was not.
+static int points_for_window(uint8_t w) {
+  switch (w) {
+    case HIST_WINDOW_30D: return 30;   // days
+    case HIST_WINDOW_1Y:  return 12;   // months
+    default:              return 24;   // hours
+  }
+}
+
+static const char* bucket_name(uint8_t w) {
+  switch (w) {
+    case HIST_WINDOW_30D: return "day";
+    case HIST_WINDOW_1Y:  return "month";
+    default:              return "hour";
+  }
+}
+
+// Points currently on the charts. Both charts are resized together so the
+// rate line stays registered with the columns it belongs to.
+static int s_pointCount = 24;
+
+static void set_point_count(int n) {
+  s_pointCount = n;
+  lv_chart_set_point_count(s_chart, n);
+  lv_chart_set_point_count(s_rateChart, n);
+}
 static bool    s_usingHub = false;
 
 static const char* window_name(uint8_t w) {
@@ -468,7 +498,9 @@ static void open_detail(int tileIdx) {
   // Ask the hub as the page opens. The reply is asynchronous, so the first
   // paint shows the local series and the hub's supersedes it a moment later
   // — better than a blank chart while a round trip completes.
-  espnow_history_request(TILE_DESC[tileIdx].hubMetric, s_window, CHART_POINTS);
+  set_point_count(points_for_window(s_window));
+  espnow_history_request(TILE_DESC[tileIdx].hubMetric, s_window,
+                         (uint8_t)s_pointCount);
   refresh_detail();
   lv_scr_load(s_detailScr);
 }
@@ -480,8 +512,10 @@ static void cycle_window(lv_event_t* e) {
   s_window = (s_window == HIST_WINDOW_24H) ? HIST_WINDOW_30D
            : (s_window == HIST_WINDOW_30D) ? HIST_WINDOW_1Y
                                            : HIST_WINDOW_24H;
+  set_point_count(points_for_window(s_window));
   if (s_openTile >= 0)
-    espnow_history_request(TILE_DESC[s_openTile].hubMetric, s_window, CHART_POINTS);
+    espnow_history_request(TILE_DESC[s_openTile].hubMetric, s_window,
+                           (uint8_t)s_pointCount);
   if (s_winLbl) lv_label_set_text(s_winLbl, window_name(s_window));
 }
 
@@ -495,7 +529,7 @@ static void refresh_detail() {
   // the state poll, so it retries about every five seconds at no extra cost.
   if (!espnow_history_ready()) {
     espnow_history_request(TILE_DESC[s_openTile].hubMetric, s_window,
-                           CHART_POINTS);
+                           (uint8_t)s_pointCount);
   }
   const int idx = s_openTile;
   const tile_desc_t& d = TILE_DESC[idx];
@@ -523,7 +557,7 @@ static void refresh_detail() {
   // rather than kept separately, so the numbers always describe the chart
   // the user is actually looking at.
   int16_t mn, mx, av;
-  if (statsOf(s_pts, CHART_POINTS, &mn, &mx, &av)) {
+  if (statsOf(s_pts, s_pointCount, &mn, &mx, &av)) {
     char sMn[16], sMx[16], sAv[16];
     fmt_metric(sMn, sizeof(sMn), idx, mn);
     fmt_metric(sMx, sizeof(sMx), idx, mx);
@@ -542,18 +576,18 @@ static void refresh_detail() {
   // says so rather than quietly showing a shorter different series.
   int valid = 0;
   s_usingHub = false;
-  for (int i = 0; i < CHART_POINTS; i++) s_pts[i] = HIST_NO_DATA;
+  for (int i = 0; i < s_pointCount; i++) s_pts[i] = HIST_NO_DATA;
   if (espnow_history_ready()) {
-    int n = espnow_history_values(s_pts, CHART_POINTS);
+    int n = espnow_history_values(s_pts, s_pointCount);
     if (n > 0) {
       // Right-align a short series so the newest point stays at the right
       // edge rather than the chart appearing to run backwards in time.
-      if (n < CHART_POINTS) {
-        int shift = CHART_POINTS - n;
-        for (int i = CHART_POINTS - 1; i >= shift; i--) s_pts[i] = s_pts[i - shift];
+      if (n < s_pointCount) {
+        int shift = s_pointCount - n;
+        for (int i = s_pointCount - 1; i >= shift; i--) s_pts[i] = s_pts[i - shift];
         for (int i = 0; i < shift; i++) s_pts[i] = HIST_NO_DATA;
       }
-      for (int i = 0; i < CHART_POINTS; i++)
+      for (int i = 0; i < s_pointCount; i++)
         if (s_pts[i] != HIST_NO_DATA) valid++;
       s_usingHub = true;
     }
@@ -582,8 +616,12 @@ static void refresh_detail() {
   // Scaled ×10 so a tenth of a unit per hour survives the integer chart:
   // fuel burn is often under 1 %/h and would otherwise quantise to a flat
   // line at zero. The axis labels divide it back out.
-  const uint16_t iv = s_usingHub ? espnow_history_interval_s() : 60;
-  const float perHour = iv ? 3600.0f / (float)iv : 60.0f;
+  // Each column now spans a whole bucket, so the step between columns is the
+  // bucket width, not the tier's sample interval.
+  const float bucketH = (s_window == HIST_WINDOW_1Y)  ? (24.0f * 30.0f)
+                      : (s_window == HIST_WINDOW_30D) ? 24.0f
+                                                      : 1.0f;
+  const float perHour = 1.0f / bucketH;
   // Litres per hour when the hub has told us the tank's size — percent per
   // hour cannot answer "how much fuel", which is the whole point.
   const float toUnits = (idx < 2 && s_tankCapacityL[idx] > 0)
@@ -591,7 +629,7 @@ static void refresh_detail() {
 
   int16_t rateLo = 0, rateHi = 0;
   bool haveRate = false;
-  for (int i = 0; i < CHART_POINTS; i++) {
+  for (int i = 0; i < s_pointCount; i++) {
     if (i == 0 || pts[i] == HIST_NO_DATA || pts[i - 1] == HIST_NO_DATA) {
       s_ratePts[i] = LV_CHART_POINT_NONE;
       continue;
@@ -613,8 +651,9 @@ static void refresh_detail() {
     lv_chart_set_range(s_rateChart, LV_CHART_AXIS_PRIMARY_Y, -mag, mag);
     const char* rUnit = (idx < 2 && s_tankCapacityL[idx] > 0) ? "L/h" : "%/h";
     char lbuf[72];
-    snprintf(lbuf, sizeof(lbuf), "#4A9EFF bars# level %%    #FFB020 line# rate %s  (max %.1f)",
-             rUnit, mag / 10.0f);
+    snprintf(lbuf, sizeof(lbuf),
+             "#4A9EFF bars# level %% per %s    #FFB020 line# rate %s (max %.1f)",
+             bucket_name(s_window), rUnit, mag / 10.0f);
     lv_label_set_recolor(s_legend, true);
     lv_label_set_text(s_legend, lbuf);
   } else {
@@ -624,7 +663,7 @@ static void refresh_detail() {
 
   // Write straight into the array LVGL is already pointing at, then
   // invalidate once.
-  for (int i = 0; i < CHART_POINTS; i++) {
+  for (int i = 0; i < s_pointCount; i++) {
     s_chartPts[i] = (pts[i] == HIST_NO_DATA) ? LV_CHART_POINT_NONE
                                              : (lv_coord_t)pts[i];
   }
