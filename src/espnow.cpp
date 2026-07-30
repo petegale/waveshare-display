@@ -390,6 +390,7 @@ void espnow_history_request(uint8_t metricIdx, uint8_t window, uint8_t nPoints) 
 bool espnow_history_ready() { return s_histReady; }
 
 uint16_t espnow_history_interval_s() { return s_hist.interval_s; }
+uint32_t espnow_history_newest_utc()  { return s_hist.newest_utc_s; }
 
 int espnow_history_values(int16_t* out, int maxOut) {
   if (!s_histReady || !out) return 0;

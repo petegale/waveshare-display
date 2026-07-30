@@ -167,16 +167,60 @@ static const char* bucket_name(uint8_t w) {
 static int s_pointCount = 24;
 static bool s_statsPending = false;
 static lv_obj_t* s_probe = nullptr;
+// Column currently under the finger, or -1. Read by the draw hook.
+static int s_pressedIdx = -1;
+
+static void chart_draw_part(lv_event_t* e) {
+  lv_obj_draw_part_dsc_t* dsc = lv_event_get_draw_part_dsc(e);
+  if (!dsc || dsc->part != LV_PART_ITEMS) return;
+  if (s_pressedIdx < 0 || (int)dsc->id != s_pressedIdx) return;
+  if (!dsc->rect_dsc) return;
+  dsc->rect_dsc->bg_color = COL_TEXT;      // near-white against the blue
+  dsc->rect_dsc->border_color = COL_TEXT;
+}
 
 static void fmt_metric(char* buf, size_t n, int tileIdx, int16_t raw);
+static void days_to_ymd(uint16_t days, int& y, int& m, int& d);
 
-// How far back a column sits, in its own unit — "6 days ago" reads better
-// than an index, and the newest column is at the right.
-static void bucket_age(char* out, size_t n, int idx, int count) {
+// When a column happened, as a clock time or a date. "16 hours ago" is only
+// useful if you already know what time you are reading it, and on a boat you
+// often do not — a date is what you compare against the log book.
+//
+// Falls back to relative only when the hub has no time source at all, which
+// is the one case where an absolute label would be a fabrication.
+static const char* MONTHS[12] = { "Jan","Feb","Mar","Apr","May","Jun",
+                                  "Jul","Aug","Sep","Oct","Nov","Dec" };
+
+static void bucket_when(char* out, size_t n, int idx, int count) {
   int back = (count - 1) - idx;
-  if (back <= 0) { snprintf(out, n, "now"); return; }
-  snprintf(out, n, "%d %s%s ago", back, bucket_name(s_window),
-           back == 1 ? "" : "s");
+  uint32_t newest = espnow_history_newest_utc();
+  uint16_t iv     = espnow_history_interval_s();
+
+  if (newest == 0 || iv == 0) {
+    if (back <= 0) { snprintf(out, n, "latest"); return; }
+    snprintf(out, n, "%d %s%s back", back, bucket_name(s_window),
+             back == 1 ? "" : "s");
+    return;
+  }
+
+  uint32_t t = newest - (uint32_t)back * (uint32_t)iv;
+  uint32_t days = t / 86400UL;
+  uint32_t secs = t % 86400UL;
+  int y, mo, d;
+  days_to_ymd((uint16_t)days, y, mo, d);
+
+  switch (s_window) {
+    case HIST_WINDOW_1Y:
+      snprintf(out, n, "%s %d", MONTHS[(mo - 1) % 12], y);
+      break;
+    case HIST_WINDOW_30D:
+      snprintf(out, n, "%d %s", d, MONTHS[(mo - 1) % 12]);
+      break;
+    default:
+      snprintf(out, n, "%02u:%02u", (unsigned)(secs / 3600),
+               (unsigned)((secs % 3600) / 60));
+      break;
+  }
 }
 
 static void chart_pressed(lv_event_t* e) {
@@ -187,11 +231,12 @@ static void chart_pressed(lv_event_t* e) {
   if (s_pts[id] == HIST_NO_DATA) {
     lv_label_set_text(s_probe, "#B4B4B4 no data for this bucket#");
     lv_obj_clear_flag(s_probe, LV_OBJ_FLAG_HIDDEN);
+    if (s_pressedIdx != (int)id) { s_pressedIdx = (int)id; lv_obj_invalidate(s_chart); }
     return;
   }
 
   char age[32], val[16];
-  bucket_age(age, sizeof(age), id, s_pointCount);
+  bucket_when(age, sizeof(age), id, s_pointCount);
   fmt_metric(val, sizeof(val), s_openTile, s_pts[id]);
 
   // Show the level and, when this bucket has one, its own rate — the figure
@@ -208,12 +253,17 @@ static void chart_pressed(lv_event_t* e) {
   }
   lv_label_set_text(s_probe, line);
   lv_obj_clear_flag(s_probe, LV_OBJ_FLAG_HIDDEN);
+  // Repaint only when the column changes — a finger held still would
+  // otherwise invalidate the chart on every press event.
+  if (s_pressedIdx != (int)id) { s_pressedIdx = (int)id; lv_obj_invalidate(s_chart); }
 }
 
 static void chart_released(lv_event_t* e) {
   (void)e;
-  // Left up on release rather than cleared: lifting a finger to read the
-  // number should not take the number away.
+  // Momentary: the readout belongs to the finger, and leaving it up after the
+  // finger has gone leaves a number on screen with nothing pointing at it.
+  if (s_probe) lv_obj_add_flag(s_probe, LV_OBJ_FLAG_HIDDEN);
+  if (s_pressedIdx >= 0) { s_pressedIdx = -1; lv_obj_invalidate(s_chart); }
 }
 
 static void set_point_count(int n) {
@@ -236,6 +286,7 @@ static void refresh_detail();
 static void cycle_window(lv_event_t* e);
 static void chart_pressed(lv_event_t* e);
 static void chart_released(lv_event_t* e);
+static void chart_draw_part(lv_event_t* e);
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 static const char* fluid_name(uint8_t f) {
@@ -404,6 +455,13 @@ static void build_detail_screen() {
   lv_obj_add_event_cb(s_chart, chart_pressed, LV_EVENT_PRESSING, NULL);
   lv_obj_add_event_cb(s_chart, chart_pressed, LV_EVENT_PRESSED, NULL);
   lv_obj_add_event_cb(s_chart, chart_released, LV_EVENT_RELEASED, NULL);
+  lv_obj_add_event_cb(s_chart, chart_released, LV_EVENT_PRESS_LOST, NULL);
+  // Recolour the pressed bar as it is drawn. LVGL has no per-point colour for
+  // a bar series, so the draw hook is the only way to give the column itself
+  // a pressed state — and the column is what the finger is on, so the column
+  // is what should respond. A crosshair over the top would be a different
+  // thing sitting in front of the answer.
+  lv_obj_add_event_cb(s_chart, chart_draw_part, LV_EVENT_DRAW_PART_BEGIN, NULL);
   s_chartSer = lv_chart_add_series(s_chart, COL_FILL, LV_CHART_AXIS_PRIMARY_Y);
   for (int i = 0; i < CHART_POINTS; i++) s_chartPts[i] = LV_CHART_POINT_NONE;
   lv_chart_set_ext_y_array(s_chart, s_chartSer, s_chartPts);
@@ -747,39 +805,16 @@ static void refresh_detail() {
   if (s_statsPending) {
     s_statsPending = false;
     int16_t mn, mx, av;
-    if (statsOf(pts, s_pointCount, &mn, &mx, &av) && haveRate) {
-      // Average only the buckets where something was actually drawn down.
-      //
-      // A flat mean over the whole window is worse than no figure: water sits
-      // untouched all week and is used hard at the weekend, so averaging the
-      // idle days in reports a consumption nobody has ever experienced. Rises
-      // are excluded too — a refill is not negative consumption.
-      //
-      // The threshold is a twentieth of the largest single-bucket draw, which
-      // scales with the metric instead of assuming litres or percent, and
-      // keeps sensor jitter from counting as a day aboard.
-      int32_t worst = 0;
-      for (int i = 0; i < s_pointCount; i++) {
-        if (s_ratePts[i] == LV_CHART_POINT_NONE) continue;
-        if (s_ratePts[i] < worst) worst = s_ratePts[i];
-      }
-      int32_t thresh = worst / 20;          // negative
-      int32_t rsum = 0; int rn = 0;
-      for (int i = 0; i < s_pointCount; i++) {
-        if (s_ratePts[i] == LV_CHART_POINT_NONE) continue;
-        if (s_ratePts[i] >= thresh) continue;   // idle, or a refill
-        rsum += s_ratePts[i]; rn++;
-      }
+    // No average here any more. A mean over the whole window blended idle
+    // days with days aboard and reported a rate nobody experiences; averaging
+    // only the active buckets fixed the arithmetic but not the reading — "6 of
+    // 30" needs explaining every time, and on a battery, which cycles rather
+    // than depletes, "active" barely means anything. The touch readout gives
+    // an exact figure for an exact bucket, which needs no caveat at all.
+    if (statsOf(pts, s_pointCount, &mn, &mx, &av)) {
       char sMn[16];
       fmt_metric(sMn, sizeof(sMn), idx, mn);
-      const char* uBase = (idx < 2 && s_tankCapacityL[idx] > 0) ? "L" : "%";
-      if (rn) {
-        float useRate = -(float)rsum / (float)rn / 10.0f;
-        snprintf(buf, sizeof(buf), "low %s    %.1f %s per active %s  (%d of %d)",
-                 sMn, useRate, uBase, bucket_name(s_window), rn, s_pointCount);
-      } else {
-        snprintf(buf, sizeof(buf), "low %s    no use in this window", sMn);
-      }
+      snprintf(buf, sizeof(buf), "low %s", sMn);
     } else {
       snprintf(buf, sizeof(buf), "collecting…");
     }

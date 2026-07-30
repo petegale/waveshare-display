@@ -57,3 +57,8 @@ int espnow_history_values(int16_t* out, int maxOut);
 
 // Seconds each returned point represents, for the time axis.
 uint16_t espnow_history_interval_s();
+
+// Wall-clock of the newest returned bucket, seconds since epoch, or 0 when
+// the hub has no time source. Lets a chart label columns with a date rather
+// than an offset from an unknown now.
+uint32_t espnow_history_newest_utc();
