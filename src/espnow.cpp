@@ -277,6 +277,21 @@ void espnow_tick() {
                   s_hist.v_min, s_hist.v_max);
   }
 
+  // One-shot self-test: ask for a chart ten seconds after the link comes up,
+  // without waiting for anyone to touch the screen. The request/response path
+  // had gone several rounds unverified purely because a capture window and a
+  // finger tap never coincided. Costs one 7-byte frame per boot and touches
+  // no UI state.
+#ifdef HIST_SELFTEST
+  static bool selfTestDone = false;
+  if (!selfTestDone && s_everUp && (now - s_lastStateMs) < 10000 &&
+      now > 10000) {
+    selfTestDone = true;
+    Serial.println("HIST selftest: requesting tank0 / 24h");
+    espnow_history_request(HIST_METRIC_TANK0, HIST_WINDOW_24H, 120);
+  }
+#endif
+
   if (s_gotState.exchange(false)) {
     s_lastStateMs = now;
     s_everUp      = true;
