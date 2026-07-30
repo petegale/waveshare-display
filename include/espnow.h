@@ -46,7 +46,10 @@ uint32_t espnow_seconds_since_state();
 
 // Ask the hub for a series. Fire and forget; the reply lands asynchronously
 // and espnow_history_ready() goes true.
-void espnow_history_request(uint8_t metricIdx, uint8_t window, uint8_t nPoints);
+// `pageBack` walks backwards in whole screenfuls: 0 is the most recent
+// nPoints buckets, 1 the nPoints before those.
+void espnow_history_request(uint8_t metricIdx, uint8_t window, uint8_t nPoints,
+                            uint16_t pageBack);
 
 // True once a response for the most recent request has arrived.
 bool espnow_history_ready();

@@ -77,6 +77,8 @@ static lv_obj_t*        s_dSpan  = nullptr;
 static lv_obj_t*        s_chart  = nullptr;
 static lv_chart_series_t* s_chartSer = nullptr;
 static lv_obj_t* s_winBtn = nullptr;
+static lv_obj_t* s_backBtn = nullptr;
+static lv_obj_t* s_fwdBtn = nullptr;
 static lv_obj_t* s_winLbl = nullptr;
 
 // Which metric the detail page is currently showing, or -1 when closed.
@@ -186,6 +188,10 @@ static const char* bucket_name(uint8_t w) {
 // Points currently on the charts. Both charts are resized together so the
 // rate line stays registered with the columns it belongs to.
 static int s_pointCount = 24;
+
+// How many screenfuls back the chart is showing. Reset on opening a page or
+// changing window: the offset means nothing once the column width changes.
+static uint16_t s_pageBack = 0;
 static lv_obj_t* s_probe = nullptr;
 // Column currently under the finger, or -1. Read by the draw hook.
 static int s_pressedIdx = -1;
@@ -335,6 +341,9 @@ static void cycle_window(lv_event_t* e);
 static void chart_pressed(lv_event_t* e);
 static void chart_released(lv_event_t* e);
 static void chart_draw_part(lv_event_t* e);
+static void page_older(lv_event_t* e);
+static void page_newer(lv_event_t* e);
+static void request_page();
 static void rate_draw_part(lv_event_t* e);
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -476,6 +485,35 @@ static void build_detail_screen() {
   lv_label_set_text(s_winLbl, window_name(s_window));
   lv_obj_center(s_winLbl);
   children_ignore_touch(s_winBtn);
+
+  // ◀ and ▶ flank the window button, so "which span" and "which period"
+  // read as one control rather than three scattered ones.
+  struct { lv_obj_t** btn; const char* txt; lv_coord_t x; lv_event_cb_t cb; }
+  pagers[2] = {
+    { &s_backBtn, "<", -348, page_older },
+    { &s_fwdBtn,  ">", -282, page_newer },
+  };
+  for (int i = 0; i < 2; i++) {
+    lv_obj_t* b = lv_btn_create(s_detailScr);
+    *pagers[i].btn = b;
+    lv_obj_set_size(b, 58, 56);
+    lv_obj_align(b, LV_ALIGN_TOP_RIGHT, pagers[i].x, 14);
+    lv_obj_set_style_bg_color(b, COL_PANEL, 0);
+    lv_obj_set_style_border_color(b, COL_BORDER, 0);
+    lv_obj_set_style_border_width(b, 2, 0);
+    lv_obj_set_style_border_color(b, COL_FILL, LV_STATE_PRESSED);
+    // Visibly unavailable rather than silently inert.
+    lv_obj_set_style_bg_opa(b, LV_OPA_30, LV_STATE_DISABLED);
+    lv_obj_set_style_border_opa(b, LV_OPA_30, LV_STATE_DISABLED);
+    lv_obj_add_event_cb(b, pagers[i].cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* l = lv_label_create(b);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(l, COL_TEXT, 0);
+    lv_label_set_text(l, pagers[i].txt);
+    lv_obj_center(l);
+    children_ignore_touch(b);
+  }
+  lv_obj_add_state(s_fwdBtn, LV_STATE_DISABLED);   // starts at the live edge
 
   s_chart = lv_chart_create(s_detailScr);
   lv_obj_set_size(s_chart, CHART_W, CHART_H);
@@ -722,10 +760,42 @@ static void open_detail(int tileIdx) {
     lv_label_set_text(s_loading, "Loading");
     lv_obj_clear_flag(s_loading, LV_OBJ_FLAG_HIDDEN);
   }
+  s_pageBack = 0;
   espnow_history_request(TILE_DESC[tileIdx].hubMetric, s_window,
-                         (uint8_t)s_pointCount);
+                         (uint8_t)s_pointCount, s_pageBack);
   refresh_detail();
   lv_scr_load(s_detailScr);
+}
+
+static void request_page() {
+  if (s_openTile < 0) return;
+  if (s_loading) {
+    lv_label_set_text(s_loading, "Loading");
+    lv_obj_clear_flag(s_loading, LV_OBJ_FLAG_HIDDEN);
+  }
+  espnow_history_request(TILE_DESC[s_openTile].hubMetric, s_window,
+                         (uint8_t)s_pointCount, s_pageBack);
+  // FORWARD is meaningless at the live edge, and a button that does nothing
+  // is worse than one that is visibly unavailable.
+  if (s_fwdBtn) {
+    if (s_pageBack == 0) lv_obj_add_state(s_fwdBtn, LV_STATE_DISABLED);
+    else                 lv_obj_clear_state(s_fwdBtn, LV_STATE_DISABLED);
+  }
+}
+
+// Paging replaces pinch-zoom: a drag across this chart already means "read
+// the values", so overloading it with a pan would make both worse. Whole
+// screenfuls also keep every page on the same bucket boundaries.
+static void page_older(lv_event_t* e) {
+  (void)e;
+  if (s_pageBack < 1000) s_pageBack++;
+  request_page();
+}
+
+static void page_newer(lv_event_t* e) {
+  (void)e;
+  if (s_pageBack > 0) s_pageBack--;
+  request_page();
 }
 
 // Cycle 24 h → 30 d → 1 y. One button rather than three: the detail page is
@@ -736,9 +806,10 @@ static void cycle_window(lv_event_t* e) {
            : (s_window == HIST_WINDOW_30D) ? HIST_WINDOW_1Y
                                            : HIST_WINDOW_24H;
   set_point_count(points_for_window(s_window));
+  s_pageBack = 0;
   if (s_openTile >= 0)
     espnow_history_request(TILE_DESC[s_openTile].hubMetric, s_window,
-                           (uint8_t)s_pointCount);
+                           (uint8_t)s_pointCount, s_pageBack);
   if (s_winLbl) lv_label_set_text(s_winLbl, window_name(s_window));
 }
 
@@ -752,7 +823,7 @@ static void refresh_detail() {
   // the state poll, so it retries about every five seconds at no extra cost.
   if (!espnow_history_ready()) {
     espnow_history_request(TILE_DESC[s_openTile].hubMetric, s_window,
-                           (uint8_t)s_pointCount);
+                           (uint8_t)s_pointCount, s_pageBack);
   }
   const int idx = s_openTile;
   const tile_desc_t& d = TILE_DESC[idx];
