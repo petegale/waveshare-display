@@ -487,6 +487,16 @@ static void cycle_window(lv_event_t* e) {
 
 static void refresh_detail() {
   if (s_openTile < 0) return;
+
+  // Re-ask while the page is open and still empty. The request is a single
+  // unacknowledged ESP-NOW frame: lose it — or send it in the moment the link
+  // is re-probing — and the chart stays blank for as long as the page is up,
+  // with nothing on screen to say a reply was ever expected. This runs off
+  // the state poll, so it retries about every five seconds at no extra cost.
+  if (!espnow_history_ready()) {
+    espnow_history_request(TILE_DESC[s_openTile].hubMetric, s_window,
+                           CHART_POINTS);
+  }
   const int idx = s_openTile;
   const tile_desc_t& d = TILE_DESC[idx];
   char buf[96];

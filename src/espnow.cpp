@@ -109,6 +109,8 @@ static void dropUnicastPeers() {
 }
 
 // ─── RX (NimBLE-free; runs on the WiFi task) ────────────────────────────────
+static volatile bool s_rxStateLog = false;
+static volatile bool s_histLog = false;
 static volatile uint32_t s_rxTotal = 0;
 static volatile int      s_rxLastLen = -1;
 
@@ -137,6 +139,7 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
     if (s->type != DISPLAY_RESP_STATE) return;
     memcpy(&s_state, s, sizeof(s_state));
     s_gotState.store(true);
+    s_rxStateLog = true;
     return;
   }
 
@@ -146,6 +149,7 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
     if (h->type != HIST_MSG_RESPONSE) return;
     memcpy(&s_hist, h, sizeof(s_hist));
     s_histReady = true;
+    s_histLog   = true;
     return;
   }
 
@@ -266,9 +270,25 @@ void espnow_tick() {
     clearPairing();
   }
 
+  if (s_histLog) {
+    s_histLog = false;
+    Serial.printf("HIST RX metric=%u window=%u points=%u vmin=%d vmax=%d\n",
+                  s_hist.metric_idx, s_hist.window, s_hist.n_points,
+                  s_hist.v_min, s_hist.v_max);
+  }
+
   if (s_gotState.exchange(false)) {
     s_lastStateMs = now;
     s_everUp      = true;
+    if (s_rxStateLog) {
+      s_rxStateLog = false;
+      // What actually arrived, decoded on this side. The hub logs what it
+      // believes it sent; this is the only way to tell the two apart.
+      Serial.printf("STATE n_tanks=%u t0=%u t1=%u batt=%u ver=%u\n",
+                    s_state.n_tanks, s_state.tanks[0].level_pct,
+                    s_state.tanks[1].level_pct, s_state.batt_soc_pct,
+                    s_state.protocol_version);
+    }
     display_update(s_state);
   }
 
@@ -333,7 +353,13 @@ uint32_t espnow_seconds_since_state() {
 
 // ─── Hub history ────────────────────────────────────────────────────────────
 void espnow_history_request(uint8_t metricIdx, uint8_t window, uint8_t nPoints) {
-  if (espnow_link_state() != LINK_UP) return;
+  if (espnow_link_state() != LINK_UP) {
+    Serial.printf("HIST TX skipped — link not up (state=%d)\n",
+                  (int)espnow_link_state());
+    return;
+  }
+  Serial.printf("HIST TX metric=%u window=%u points=%u\n",
+                metricIdx, window, nPoints);
   s_histReady = false;
   history_request_t req = {};
   req.magic[0]   = PROBE_MAGIC_0;
