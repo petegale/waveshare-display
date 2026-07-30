@@ -244,18 +244,32 @@ static const char* MONTHS[12] = { "Jan","Feb","Mar","Apr","May","Jun",
                                   "Jul","Aug","Sep","Oct","Nov","Dec" };
 
 static void bucket_when(char* out, size_t n, int idx, int count) {
-  int back = (count - 1) - idx;
+  // Distance back from NOW, not from the right-hand edge of the page. The
+  // offset was previously left out, so every page reported the same handful
+  // of ages — "1 hour back" on a view six pages into the past, which is the
+  // one number the label exists to give.
+  uint32_t back = (uint32_t)((count - 1) - idx) + s_offsetBuckets;
   uint32_t newest = espnow_history_newest_utc();
   uint16_t iv     = espnow_history_interval_s();
 
   if (newest == 0 || iv == 0) {
-    if (back <= 0) { snprintf(out, n, "latest"); return; }
-    snprintf(out, n, "%d %s%s back", back, bucket_name(s_window),
-             back == 1 ? "" : "s");
+    if (back == 0) { snprintf(out, n, "latest"); return; }
+    // Promote to a coarser unit once the count gets unwieldy: "3 days back"
+    // is readable where "76 hours back" has to be divided in the head.
+    if (s_window == HIST_WINDOW_24H && back >= 48) {
+      snprintf(out, n, "%lu days back", (unsigned long)(back / 24));
+    } else if (s_window == HIST_WINDOW_30D && back >= 60) {
+      snprintf(out, n, "%lu months back", (unsigned long)(back / 30));
+    } else {
+      snprintf(out, n, "%lu %s%s back", (unsigned long)back,
+               bucket_name(s_window), back == 1 ? "" : "s");
+    }
     return;
   }
 
-  uint32_t t = newest - (uint32_t)back * (uint32_t)iv;
+  // newest_utc_s already has the page offset applied by the hub, so only the
+  // within-page distance is subtracted here.
+  uint32_t t = newest - (uint32_t)((count - 1) - idx) * (uint32_t)iv;
   uint32_t days = t / 86400UL;
   uint32_t secs = t % 86400UL;
   int y, mo, d;
