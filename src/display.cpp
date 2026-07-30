@@ -73,7 +73,7 @@ static lv_obj_t* s_detailScr = nullptr;
 
 static lv_obj_t*        s_dTitle = nullptr;
 static lv_obj_t*        s_dNow   = nullptr;
-static lv_obj_t*        s_dStats = nullptr;
+static lv_obj_t*        s_loading = nullptr;
 static lv_obj_t*        s_dSpan  = nullptr;
 static lv_obj_t*        s_chart  = nullptr;
 static lv_chart_series_t* s_chartSer = nullptr;
@@ -168,7 +168,6 @@ static const char* bucket_name(uint8_t w) {
 // Points currently on the charts. Both charts are resized together so the
 // rate line stays registered with the columns it belongs to.
 static int s_pointCount = 24;
-static bool s_statsPending = false;
 static lv_obj_t* s_probe = nullptr;
 // Column currently under the finger, or -1. Read by the draw hook.
 static int s_pressedIdx = -1;
@@ -406,11 +405,8 @@ static void build_detail_screen() {
   lv_label_set_text(s_dNow, "--");
   lv_obj_align(s_dNow, LV_ALIGN_TOP_LEFT, 20, 46);
 
-  s_dStats = lv_label_create(s_detailScr);
-  lv_obj_set_style_text_font(s_dStats, &lv_font_montserrat_20, 0);
-  lv_obj_set_style_text_color(s_dStats, COL_DIM, 0);
-  lv_label_set_text(s_dStats, "");
-  lv_obj_align(s_dStats, LV_ALIGN_TOP_LEFT, 200, 60);
+  // s_dStats removed: a single summary number beside a chart the user can
+  // now interrogate directly was one more thing to reconcile, not less.
 
   // Back button — generously sized, this gets used with wet hands.
   lv_obj_t* back = lv_btn_create(s_detailScr);
@@ -455,12 +451,12 @@ static void build_detail_screen() {
   lv_chart_set_axis_tick(s_chart, LV_CHART_AXIS_PRIMARY_Y, 6, 0, 5, 1, true, 60);
   lv_obj_set_style_text_font(s_chart, &lv_font_montserrat_20, LV_PART_TICKS);
   lv_obj_set_style_text_color(s_chart, COL_DIM, LV_PART_TICKS);
-  lv_obj_set_style_pad_left(s_chart, 8, LV_PART_MAIN);
-  // Reserve the width the rate axis occupies on the other chart, so both
-  // plot areas are identical. Tick labels shrink the plot area they belong
-  // to, so without this the line and the columns would be drawn on
-  // different horizontal scales — the line describing the bars while not
-  // lining up with them.
+  // Both charts carry the SAME padding on both sides. Tick labels are drawn
+  // in the padding, so padding is what fixes the plot area — and an earlier
+  // attempt gave these two mirror-image padding (left on one, right on the
+  // other), which put their plots in different places and made the line sit
+  // further from its columns than before there were any axes at all.
+  lv_obj_set_style_pad_left(s_chart,  AXIS_LABEL_W, LV_PART_MAIN);
   lv_obj_set_style_pad_right(s_chart, AXIS_LABEL_W, LV_PART_MAIN);
   lv_chart_set_update_mode(s_chart, LV_CHART_UPDATE_MODE_SHIFT);
   lv_obj_set_style_bg_color(s_chart, COL_PANEL, 0);
@@ -509,8 +505,8 @@ static void build_detail_screen() {
                          true, AXIS_LABEL_W);
   lv_obj_set_style_text_font(s_rateChart, &lv_font_montserrat_20, LV_PART_TICKS);
   lv_obj_set_style_text_color(s_rateChart, COL_WARN, LV_PART_TICKS);
-  lv_obj_set_style_pad_left(s_rateChart, AXIS_LABEL_W + 8, LV_PART_MAIN);
-  lv_obj_set_style_pad_right(s_rateChart, 8, LV_PART_MAIN);
+  lv_obj_set_style_pad_left(s_rateChart,  AXIS_LABEL_W, LV_PART_MAIN);
+  lv_obj_set_style_pad_right(s_rateChart, AXIS_LABEL_W, LV_PART_MAIN);
   // Tick text is rewritten in the draw hook: the series is held at ten times
   // scale so sub-unit rates survive an integer chart, and the axis must show
   // the real figure rather than that scaling artefact.
@@ -518,6 +514,16 @@ static void build_detail_screen() {
   s_rateSer = lv_chart_add_series(s_rateChart, COL_WARN, LV_CHART_AXIS_SECONDARY_Y);
   for (int i = 0; i < CHART_POINTS; i++) s_ratePts[i] = LV_CHART_POINT_NONE;
   lv_chart_set_ext_y_array(s_rateChart, s_rateSer, s_ratePts);
+
+  // A single status, centred on the plot. There were two before — a
+  // "collecting…" beside the title and a "waiting for the hub" along the
+  // bottom — which said the same thing twice, in two places, neither of them
+  // where the user was looking for the data.
+  s_loading = lv_label_create(s_detailScr);
+  lv_obj_set_style_text_font(s_loading, &lv_font_montserrat_28, 0);
+  lv_obj_set_style_text_color(s_loading, COL_DIM, 0);
+  lv_obj_align(s_loading, LV_ALIGN_CENTER, 0, 20);
+  lv_label_set_text(s_loading, "Loading…");
 
   // Touch readout. Averages answer "typically"; this answers "that column",
   // which is the question actually being asked of a chart whose interesting
@@ -672,6 +678,10 @@ static void open_detail(int tileIdx) {
   // paint shows the local series and the hub's supersedes it a moment later
   // — better than a blank chart while a round trip completes.
   set_point_count(points_for_window(s_window));
+  if (s_loading) {
+    lv_label_set_text(s_loading, "Loading…");
+    lv_obj_clear_flag(s_loading, LV_OBJ_FLAG_HIDDEN);
+  }
   espnow_history_request(TILE_DESC[tileIdx].hubMetric, s_window,
                          (uint8_t)s_pointCount);
   refresh_detail();
@@ -734,7 +744,6 @@ static void refresh_detail() {
   // number with no physical meaning — both are already visible in the bars.
   // What the bars do not state is the figure the chart exists to answer:
   // how much per day. That is computed below, once the series is in hand.
-  s_statsPending = true;
 
   // Series comes from the hub, and only from the hub. This node kept its own
   // rings for a while, which meant two different answers to the same question
@@ -835,25 +844,6 @@ static void refresh_detail() {
   // Stats worth having: the lowest the level reached, and the mean rate over
   // the window — "how much water do we use per day", stated rather than
   // estimated off a line.
-  if (s_statsPending) {
-    s_statsPending = false;
-    int16_t mn, mx, av;
-    // No average here any more. A mean over the whole window blended idle
-    // days with days aboard and reported a rate nobody experiences; averaging
-    // only the active buckets fixed the arithmetic but not the reading — "6 of
-    // 30" needs explaining every time, and on a battery, which cycles rather
-    // than depletes, "active" barely means anything. The touch readout gives
-    // an exact figure for an exact bucket, which needs no caveat at all.
-    if (statsOf(pts, s_pointCount, &mn, &mx, &av)) {
-      char sMn[16];
-      fmt_metric(sMn, sizeof(sMn), idx, mn);
-      snprintf(buf, sizeof(buf), "low %s", sMn);
-    } else {
-      snprintf(buf, sizeof(buf), "collecting…");
-    }
-    lv_label_set_text(s_dStats, buf);
-  }
-
   lv_chart_refresh(s_rateChart);
 
   // Write straight into the array LVGL is already pointing at, then
@@ -866,12 +856,16 @@ static void refresh_detail() {
 
   // Time span covered, and where it came from — a chart that silently falls
   // back to a shorter local series would otherwise look like data loss.
-  if (!s_usingHub) {
-    lv_label_set_recolor(s_legend, true);
-    lv_label_set_text(s_legend,
-      (espnow_link_state() == LINK_UP)
-        ? "#B4B4B4 waiting for the hub#"
-        : "#FF4D4D no hub connection — history unavailable#");
+  // Loading covers the plot until there is something to plot; the legend
+  // only means anything once there are traces to label.
+  if (valid > 0) {
+    lv_obj_add_flag(s_loading, LV_OBJ_FLAG_HIDDEN);
+  } else {
+    const bool linkUp = (espnow_link_state() == LINK_UP);
+    lv_obj_set_style_text_color(s_loading, linkUp ? COL_DIM : COL_ALARM, 0);
+    lv_label_set_text(s_loading, linkUp ? "Loading…" : "No hub connection");
+    lv_obj_clear_flag(s_loading, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(s_legend, "");
   }
 }
 
