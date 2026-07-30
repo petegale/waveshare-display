@@ -88,9 +88,21 @@ static display_state_t s_last     = {};
 static bool            s_haveLast = false;
 
 #define CHART_POINTS 120
-// Width reserved for a Y-axis label column, on both charts so their plot
-// areas match.
+// Space the axis tick labels need. LVGL draws them OUTSIDE the chart's
+// border box, so this is not interior padding — an earlier version treated it
+// as though it were and left the series inset by 60 px of empty frame at each
+// end for no reason.
 #define AXIS_LABEL_W 60
+
+// The only interior padding: enough that a full-height bar does not merge
+// with the frame, and no more. Identical on both charts, which is what keeps
+// the line registered with its columns.
+#define PLOT_INSET   6
+
+// Chart geometry. The single-line title freed a line of vertical space, and
+// the chart is what the page exists for, so it takes it.
+#define CHART_H      344
+#define CHART_BOTTOM 52
 
 // Backing store handed to LVGL via lv_chart_set_ext_y_array. Populating
 // the series with lv_chart_set_value_by_id() instead would invalidate the
@@ -397,13 +409,17 @@ static void build_detail_screen() {
   lv_obj_set_style_text_font(s_dTitle, &lv_font_montserrat_28, 0);
   lv_obj_set_style_text_color(s_dTitle, COL_TEXT, 0);
   lv_label_set_text(s_dTitle, "");
-  lv_obj_align(s_dTitle, LV_ALIGN_TOP_LEFT, 20, 14);
+  lv_obj_align(s_dTitle, LV_ALIGN_TOP_LEFT, 20, 30);
 
   s_dNow = lv_label_create(s_detailScr);
   lv_obj_set_style_text_font(s_dNow, &lv_font_montserrat_48, 0);
   lv_obj_set_style_text_color(s_dNow, COL_TEXT, 0);
   lv_label_set_text(s_dNow, "--");
-  lv_obj_align(s_dNow, LV_ALIGN_TOP_LEFT, 20, 46);
+  // Beside the name rather than under it. Stacking them cost a whole line of
+  // vertical space to say one thing, and the chart is what the page is for.
+  // Aligned to the title's own right edge so it follows "WATER" and
+  // "HOUSE BATTERY" alike without a hand-tuned offset per metric.
+  lv_obj_align_to(s_dNow, s_dTitle, LV_ALIGN_OUT_RIGHT_MID, 18, -2);
 
   // s_dStats removed: a single summary number beside a chart the user can
   // now interrogate directly was one more thing to reconcile, not less.
@@ -442,8 +458,8 @@ static void build_detail_screen() {
   children_ignore_touch(s_winBtn);
 
   s_chart = lv_chart_create(s_detailScr);
-  lv_obj_set_size(s_chart, SCREEN_WIDTH - 100, 300);
-  lv_obj_align(s_chart, LV_ALIGN_BOTTOM_MID, 10, -46);
+  lv_obj_set_size(s_chart, SCREEN_WIDTH - 100, CHART_H);
+  lv_obj_align(s_chart, LV_ALIGN_BOTTOM_MID, 10, -CHART_BOTTOM);
   lv_chart_set_type(s_chart, LV_CHART_TYPE_BAR);
   lv_chart_set_point_count(s_chart, CHART_POINTS);
   lv_chart_set_div_line_count(s_chart, 5, 6);
@@ -456,8 +472,8 @@ static void build_detail_screen() {
   // attempt gave these two mirror-image padding (left on one, right on the
   // other), which put their plots in different places and made the line sit
   // further from its columns than before there were any axes at all.
-  lv_obj_set_style_pad_left(s_chart,  AXIS_LABEL_W, LV_PART_MAIN);
-  lv_obj_set_style_pad_right(s_chart, AXIS_LABEL_W, LV_PART_MAIN);
+  lv_obj_set_style_pad_left(s_chart,  PLOT_INSET, LV_PART_MAIN);
+  lv_obj_set_style_pad_right(s_chart, PLOT_INSET, LV_PART_MAIN);
   lv_chart_set_update_mode(s_chart, LV_CHART_UPDATE_MODE_SHIFT);
   lv_obj_set_style_bg_color(s_chart, COL_PANEL, 0);
   lv_obj_set_style_border_color(s_chart, COL_BORDER, 0);
@@ -488,8 +504,8 @@ static void build_detail_screen() {
   // and its litres-per-hour have nothing in common but the time axis. This is
   // the same split Victron uses for voltage against current.
   s_rateChart = lv_chart_create(s_detailScr);
-  lv_obj_set_size(s_rateChart, SCREEN_WIDTH - 100, 300);
-  lv_obj_align(s_rateChart, LV_ALIGN_BOTTOM_MID, 10, -46);
+  lv_obj_set_size(s_rateChart, SCREEN_WIDTH - 100, CHART_H);
+  lv_obj_align(s_rateChart, LV_ALIGN_BOTTOM_MID, 10, -CHART_BOTTOM);
   lv_chart_set_type(s_rateChart, LV_CHART_TYPE_LINE);
   lv_chart_set_point_count(s_rateChart, CHART_POINTS);
   lv_chart_set_div_line_count(s_rateChart, 0, 0);
@@ -505,8 +521,8 @@ static void build_detail_screen() {
                          true, AXIS_LABEL_W);
   lv_obj_set_style_text_font(s_rateChart, &lv_font_montserrat_20, LV_PART_TICKS);
   lv_obj_set_style_text_color(s_rateChart, COL_WARN, LV_PART_TICKS);
-  lv_obj_set_style_pad_left(s_rateChart,  AXIS_LABEL_W, LV_PART_MAIN);
-  lv_obj_set_style_pad_right(s_rateChart, AXIS_LABEL_W, LV_PART_MAIN);
+  lv_obj_set_style_pad_left(s_rateChart,  PLOT_INSET, LV_PART_MAIN);
+  lv_obj_set_style_pad_right(s_rateChart, PLOT_INSET, LV_PART_MAIN);
   // Tick text is rewritten in the draw hook: the series is held at ten times
   // scale so sub-unit rates survive an integer chart, and the axis must show
   // the real figure rather than that scaling artefact.
@@ -542,9 +558,9 @@ static void build_detail_screen() {
 
   // Legend, so the two colours are not a guess.
   s_legend = lv_label_create(s_detailScr);
-  lv_obj_set_style_text_font(s_legend, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_font(s_legend, &lv_font_montserrat_24, 0);
   lv_obj_set_style_text_color(s_legend, COL_DIM, 0);
-  lv_obj_align(s_legend, LV_ALIGN_BOTTOM_LEFT, 20, -18);
+  lv_obj_align(s_legend, LV_ALIGN_BOTTOM_MID, 0, -14);
   lv_label_set_text(s_legend, "");
 
   // s_dSpan removed: it sat at BOTTOM_MID under a legend anchored
