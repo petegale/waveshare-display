@@ -368,7 +368,7 @@ uint32_t espnow_seconds_since_state() {
 
 // ─── Hub history ────────────────────────────────────────────────────────────
 void espnow_history_request(uint8_t metricIdx, uint8_t window, uint8_t nPoints,
-                            uint16_t pageBack) {
+                            uint16_t offsetBuckets) {
   if (espnow_link_state() != LINK_UP) {
     Serial.printf("HIST TX skipped — link not up (state=%d)\n",
                   (int)espnow_link_state());
@@ -385,7 +385,7 @@ void espnow_history_request(uint8_t metricIdx, uint8_t window, uint8_t nPoints,
   req.window     = window;
   req.n_points   = nPoints;
   req.sequence   = ++s_histSeq;
-  req.page_back  = pageBack;
+  req.offset_buckets = offsetBuckets;
   esp_now_send(s_hubMac, (const uint8_t*)&req, sizeof(req));
 }
 

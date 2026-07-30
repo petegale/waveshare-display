@@ -46,10 +46,9 @@ uint32_t espnow_seconds_since_state();
 
 // Ask the hub for a series. Fire and forget; the reply lands asynchronously
 // and espnow_history_ready() goes true.
-// `pageBack` walks backwards in whole screenfuls: 0 is the most recent
-// nPoints buckets, 1 the nPoints before those.
+// `offsetBuckets` moves the right-hand edge back by that many columns.
 void espnow_history_request(uint8_t metricIdx, uint8_t window, uint8_t nPoints,
-                            uint16_t pageBack);
+                            uint16_t offsetBuckets);
 
 // True once a response for the most recent request has arrived.
 bool espnow_history_ready();

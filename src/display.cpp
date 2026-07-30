@@ -189,9 +189,25 @@ static const char* bucket_name(uint8_t w) {
 // rate line stays registered with the columns it belongs to.
 static int s_pointCount = 24;
 
-// How many screenfuls back the chart is showing. Reset on opening a page or
-// changing window: the offset means nothing once the column width changes.
-static uint16_t s_pageBack = 0;
+// How many columns back the right-hand edge sits. Reset on opening a page or
+// changing window, since an offset in columns means nothing once the column
+// width changes under it.
+static uint16_t s_offsetBuckets = 0;
+
+// A press moves half a screen, not a whole one. Stepping a full screen
+// replaces every column at once and leaves nothing recognisable to navigate
+// by; half keeps the features the user was looking at on screen while new
+// ones arrive behind them.
+static uint16_t page_step() {
+  int half = s_pointCount / 2;
+  return (uint16_t)(half > 0 ? half : 1);
+}
+
+// Show the loading state AND clear the plot. Paging used to put the label
+// over the previous page's columns, because nothing redrew the chart until
+// the next state broadcast five seconds later — so the old data sat there
+// under the word "Loading" looking like the answer.
+static void show_loading(const char* msg);
 static lv_obj_t* s_probe = nullptr;
 // Column currently under the finger, or -1. Read by the draw hook.
 static int s_pressedIdx = -1;
@@ -472,8 +488,8 @@ static void build_detail_screen() {
   // Window selector, left of BACK. Same construction and the same
   // children_ignore_touch trap.
   s_winBtn = lv_btn_create(s_detailScr);
-  lv_obj_set_size(s_winBtn, 190, 56);
-  lv_obj_align(s_winBtn, LV_ALIGN_TOP_RIGHT, -152, 14);
+  lv_obj_set_size(s_winBtn, 170, 56);
+  lv_obj_align(s_winBtn, LV_ALIGN_TOP_RIGHT, -214, 14);
   lv_obj_set_style_bg_color(s_winBtn, COL_PANEL, 0);
   lv_obj_set_style_border_color(s_winBtn, COL_BORDER, 0);
   lv_obj_set_style_border_width(s_winBtn, 2, 0);
@@ -489,9 +505,13 @@ static void build_detail_screen() {
   // ◀ and ▶ flank the window button, so "which span" and "which period"
   // read as one control rather than three scattered ones.
   struct { lv_obj_t** btn; const char* txt; lv_coord_t x; lv_event_cb_t cb; }
+  // Positions are stepped across the top bar with a gap between each, rather
+  // than guessed: the forward button previously sat on top of the window
+  // button, so half of one control was covered by another.
+  //   BACK 660..780 | > 594..652 | window 416..586 | < 350..408
   pagers[2] = {
-    { &s_backBtn, "<", -348, page_older },
-    { &s_fwdBtn,  ">", -282, page_newer },
+    { &s_backBtn, LV_SYMBOL_LEFT,  -392, page_older },
+    { &s_fwdBtn,  LV_SYMBOL_RIGHT, -148, page_newer },
   };
   for (int i = 0; i < 2; i++) {
     lv_obj_t* b = lv_btn_create(s_detailScr);
@@ -760,26 +780,34 @@ static void open_detail(int tileIdx) {
     lv_label_set_text(s_loading, "Loading");
     lv_obj_clear_flag(s_loading, LV_OBJ_FLAG_HIDDEN);
   }
-  s_pageBack = 0;
+  s_offsetBuckets = 0;
   espnow_history_request(TILE_DESC[tileIdx].hubMetric, s_window,
-                         (uint8_t)s_pointCount, s_pageBack);
+                         (uint8_t)s_pointCount, s_offsetBuckets);
   refresh_detail();
   lv_scr_load(s_detailScr);
 }
 
+static void show_loading(const char* msg) {
+  if (!s_loading) return;
+  lv_obj_set_style_text_color(s_loading, COL_DIM, 0);
+  lv_label_set_text(s_loading, msg);
+  lv_obj_clear_flag(s_loading, LV_OBJ_FLAG_HIDDEN);
+  if (s_chart)     lv_obj_add_flag(s_chart, LV_OBJ_FLAG_HIDDEN);
+  if (s_rateChart) lv_obj_add_flag(s_rateChart, LV_OBJ_FLAG_HIDDEN);
+  if (s_legend)    lv_label_set_text(s_legend, "");
+  if (s_probe)     lv_obj_add_flag(s_probe, LV_OBJ_FLAG_HIDDEN);
+}
+
 static void request_page() {
   if (s_openTile < 0) return;
-  if (s_loading) {
-    lv_label_set_text(s_loading, "Loading");
-    lv_obj_clear_flag(s_loading, LV_OBJ_FLAG_HIDDEN);
-  }
+  show_loading("Loading");
   espnow_history_request(TILE_DESC[s_openTile].hubMetric, s_window,
-                         (uint8_t)s_pointCount, s_pageBack);
+                         (uint8_t)s_pointCount, s_offsetBuckets);
   // FORWARD is meaningless at the live edge, and a button that does nothing
   // is worse than one that is visibly unavailable.
   if (s_fwdBtn) {
-    if (s_pageBack == 0) lv_obj_add_state(s_fwdBtn, LV_STATE_DISABLED);
-    else                 lv_obj_clear_state(s_fwdBtn, LV_STATE_DISABLED);
+    if (s_offsetBuckets == 0) lv_obj_add_state(s_fwdBtn, LV_STATE_DISABLED);
+    else                      lv_obj_clear_state(s_fwdBtn, LV_STATE_DISABLED);
   }
 }
 
@@ -788,13 +816,15 @@ static void request_page() {
 // screenfuls also keep every page on the same bucket boundaries.
 static void page_older(lv_event_t* e) {
   (void)e;
-  if (s_pageBack < 1000) s_pageBack++;
+  uint32_t next = (uint32_t)s_offsetBuckets + page_step();
+  s_offsetBuckets = (next > 60000) ? 60000 : (uint16_t)next;
   request_page();
 }
 
 static void page_newer(lv_event_t* e) {
   (void)e;
-  if (s_pageBack > 0) s_pageBack--;
+  uint16_t step = page_step();
+  s_offsetBuckets = (s_offsetBuckets > step) ? (uint16_t)(s_offsetBuckets - step) : 0;
   request_page();
 }
 
@@ -806,10 +836,10 @@ static void cycle_window(lv_event_t* e) {
            : (s_window == HIST_WINDOW_30D) ? HIST_WINDOW_1Y
                                            : HIST_WINDOW_24H;
   set_point_count(points_for_window(s_window));
-  s_pageBack = 0;
+  s_offsetBuckets = 0;
   if (s_openTile >= 0)
     espnow_history_request(TILE_DESC[s_openTile].hubMetric, s_window,
-                           (uint8_t)s_pointCount, s_pageBack);
+                           (uint8_t)s_pointCount, s_offsetBuckets);
   if (s_winLbl) lv_label_set_text(s_winLbl, window_name(s_window));
 }
 
@@ -823,7 +853,7 @@ static void refresh_detail() {
   // the state poll, so it retries about every five seconds at no extra cost.
   if (!espnow_history_ready()) {
     espnow_history_request(TILE_DESC[s_openTile].hubMetric, s_window,
-                           (uint8_t)s_pointCount, s_pageBack);
+                           (uint8_t)s_pointCount, s_offsetBuckets);
   }
   const int idx = s_openTile;
   const tile_desc_t& d = TILE_DESC[idx];
@@ -953,15 +983,28 @@ static void refresh_detail() {
 
   // Time span covered, and where it came from — a chart that silently falls
   // back to a shorter local series would otherwise look like data loss.
-  // Loading covers the plot until there is something to plot; the legend
-  // only means anything once there are traces to label.
+  // Charts are hidden outright while there is nothing to draw, rather than
+  // left as an empty frame with a word floating over it — an axis with no
+  // series still reads as a chart, so the message looked like an overlay on
+  // real data instead of a replacement for it.
+  const bool linkUp  = (espnow_link_state() == LINK_UP);
+  const bool replied = espnow_history_ready();
   if (valid > 0) {
     lv_obj_add_flag(s_loading, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_chart, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_rateChart, LV_OBJ_FLAG_HIDDEN);
   } else {
-    const bool linkUp = (espnow_link_state() == LINK_UP);
+    // "Loading" only while a reply is genuinely outstanding. A page earlier
+    // than the record comes back full of gaps, and saying "Loading" forever
+    // in that case claims work is in progress that finished long ago.
+    const char* msg = !linkUp  ? "No hub connection"
+                    : !replied ? "Loading"
+                               : "No data for this period";
     lv_obj_set_style_text_color(s_loading, linkUp ? COL_DIM : COL_ALARM, 0);
-    lv_label_set_text(s_loading, linkUp ? "Loading" : "No hub connection");
+    lv_label_set_text(s_loading, msg);
     lv_obj_clear_flag(s_loading, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_chart, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_rateChart, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(s_legend, "");
   }
 }
