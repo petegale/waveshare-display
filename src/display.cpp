@@ -88,6 +88,9 @@ static display_state_t s_last     = {};
 static bool            s_haveLast = false;
 
 #define CHART_POINTS 120
+// Width reserved for a Y-axis label column, on both charts so their plot
+// areas match.
+#define AXIS_LABEL_W 60
 
 // Backing store handed to LVGL via lv_chart_set_ext_y_array. Populating
 // the series with lv_chart_set_value_by_id() instead would invalidate the
@@ -169,6 +172,16 @@ static bool s_statsPending = false;
 static lv_obj_t* s_probe = nullptr;
 // Column currently under the finger, or -1. Read by the draw hook.
 static int s_pressedIdx = -1;
+
+// Rate axis labels: the series is stored at ten times scale, so 53 on the
+// axis means 5.3 in the world. Rewrite the text rather than change the
+// storage — the scaling is what stops fuel burn under 1 %/h quantising to a
+// flat line at zero.
+static void rate_draw_part(lv_event_t* e) {
+  lv_obj_draw_part_dsc_t* dsc = lv_event_get_draw_part_dsc(e);
+  if (!dsc || dsc->part != LV_PART_TICKS || !dsc->text) return;
+  snprintf(dsc->text, dsc->text_length, "%.1f", (float)dsc->value / 10.0f);
+}
 
 static void chart_draw_part(lv_event_t* e) {
   lv_obj_draw_part_dsc_t* dsc = lv_event_get_draw_part_dsc(e);
@@ -287,6 +300,7 @@ static void cycle_window(lv_event_t* e);
 static void chart_pressed(lv_event_t* e);
 static void chart_released(lv_event_t* e);
 static void chart_draw_part(lv_event_t* e);
+static void rate_draw_part(lv_event_t* e);
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 static const char* fluid_name(uint8_t f) {
@@ -442,6 +456,12 @@ static void build_detail_screen() {
   lv_obj_set_style_text_font(s_chart, &lv_font_montserrat_20, LV_PART_TICKS);
   lv_obj_set_style_text_color(s_chart, COL_DIM, LV_PART_TICKS);
   lv_obj_set_style_pad_left(s_chart, 8, LV_PART_MAIN);
+  // Reserve the width the rate axis occupies on the other chart, so both
+  // plot areas are identical. Tick labels shrink the plot area they belong
+  // to, so without this the line and the columns would be drawn on
+  // different horizontal scales — the line describing the bars while not
+  // lining up with them.
+  lv_obj_set_style_pad_right(s_chart, AXIS_LABEL_W, LV_PART_MAIN);
   lv_chart_set_update_mode(s_chart, LV_CHART_UPDATE_MODE_SHIFT);
   lv_obj_set_style_bg_color(s_chart, COL_PANEL, 0);
   lv_obj_set_style_border_color(s_chart, COL_BORDER, 0);
@@ -482,7 +502,20 @@ static void build_detail_screen() {
   lv_obj_set_style_size(s_rateChart, 0, LV_PART_INDICATOR);
   lv_obj_set_style_line_width(s_rateChart, 3, LV_PART_ITEMS);
   lv_obj_clear_flag(s_rateChart, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
-  s_rateSer = lv_chart_add_series(s_rateChart, COL_WARN, LV_CHART_AXIS_PRIMARY_Y);
+  // Rate reads against its own axis on the right — the same split Victron
+  // uses, and the only way a level in percent and a rate in litres per hour
+  // can share a plot without one of them being unreadable.
+  lv_chart_set_axis_tick(s_rateChart, LV_CHART_AXIS_SECONDARY_Y, 6, 0, 5, 1,
+                         true, AXIS_LABEL_W);
+  lv_obj_set_style_text_font(s_rateChart, &lv_font_montserrat_20, LV_PART_TICKS);
+  lv_obj_set_style_text_color(s_rateChart, COL_WARN, LV_PART_TICKS);
+  lv_obj_set_style_pad_left(s_rateChart, AXIS_LABEL_W + 8, LV_PART_MAIN);
+  lv_obj_set_style_pad_right(s_rateChart, 8, LV_PART_MAIN);
+  // Tick text is rewritten in the draw hook: the series is held at ten times
+  // scale so sub-unit rates survive an integer chart, and the axis must show
+  // the real figure rather than that scaling artefact.
+  lv_obj_add_event_cb(s_rateChart, rate_draw_part, LV_EVENT_DRAW_PART_BEGIN, NULL);
+  s_rateSer = lv_chart_add_series(s_rateChart, COL_WARN, LV_CHART_AXIS_SECONDARY_Y);
   for (int i = 0; i < CHART_POINTS; i++) s_ratePts[i] = LV_CHART_POINT_NONE;
   lv_chart_set_ext_y_array(s_rateChart, s_rateSer, s_ratePts);
 
@@ -783,7 +816,7 @@ static void refresh_detail() {
     // the zero crossing sits on a fixed line rather than wandering.
     int16_t mag = (rateHi > -rateLo ? rateHi : -rateLo);
     if (mag < 10) mag = 10;
-    lv_chart_set_range(s_rateChart, LV_CHART_AXIS_PRIMARY_Y, -mag, mag);
+    lv_chart_set_range(s_rateChart, LV_CHART_AXIS_SECONDARY_Y, -mag, mag);
     // Per bucket, not per hour — the rate is scaled to the column width, so
     // labelling it /h on a day-per-column view stated the wrong quantity
     // while showing the right number.
@@ -792,8 +825,8 @@ static void refresh_detail() {
     snprintf(rUnit, sizeof(rUnit), "%s/%s", rBase, bucket_name(s_window));
     char lbuf[72];
     snprintf(lbuf, sizeof(lbuf),
-             "#4A9EFF bars# level %% per %s    #FFB020 line# rate %s (max %.1f)",
-             bucket_name(s_window), rUnit, mag / 10.0f);
+             "#4A9EFF bars# level %% per %s    #FFB020 line# rate %s",
+             bucket_name(s_window), rUnit);
     lv_label_set_recolor(s_legend, true);
     lv_label_set_text(s_legend, lbuf);
   } else {
