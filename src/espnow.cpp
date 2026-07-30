@@ -73,15 +73,52 @@ static void clearPairing() {
   p.begin("display", false);
   p.clear();
   p.end();
+  // Delete the peer BEFORE forgetting the MAC. Zeroing s_hubMac first left
+  // the hub registered as an encrypted peer with nothing left pointing at it:
+  // unrecoverable, because every later attempt to clean it up no longer knew
+  // which address to remove. The display then discarded every unencrypted
+  // probe response the hub sent and reported "Hub not found on any channel"
+  // forever, with the hub visibly answering every probe.
+  uint8_t zero[6] = {};
+  if (memcmp(s_hubMac, zero, 6) != 0 && esp_now_is_peer_exist(s_hubMac)) {
+    esp_now_del_peer(s_hubMac);
+  }
   s_paired  = false;
   s_channel = 0;
   memset(s_hubMac, 0, 6);
   memset(s_hubLmk, 0, 16);
 }
 
+// Drop every non-broadcast peer. Used before a channel sweep: probe responses
+// arrive unencrypted, so any encrypted registration left over from a previous
+// link silently swallows them. Walking the table rather than trusting
+// s_hubMac means this still works when the stored MAC has already been lost.
+static void dropUnicastPeers() {
+  esp_now_peer_info_t info;
+  static const uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+  uint8_t doomed[8][6];
+  int n = 0;
+  if (esp_now_fetch_peer(true, &info) == ESP_OK) {
+    do {
+      if (memcmp(info.peer_addr, bcast, 6) != 0 && n < 8)
+        memcpy(doomed[n++], info.peer_addr, 6);
+    } while (esp_now_fetch_peer(false, &info) == ESP_OK);
+  }
+  // Delete after walking: removing entries mid-iteration invalidates the walk.
+  for (int i = 0; i < n; i++) esp_now_del_peer(doomed[i]);
+}
+
 // ─── RX (NimBLE-free; runs on the WiFi task) ────────────────────────────────
+static volatile uint32_t s_rxTotal = 0;
+static volatile int      s_rxLastLen = -1;
+
+uint32_t espnow_rx_count()    { return s_rxTotal; }
+int      espnow_rx_last_len() { return s_rxLastLen; }
+
 static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
   if (!info || !data) return;
+  s_rxTotal++;
+  s_rxLastLen = len;
 
   if (len == (int)sizeof(probe_response_t)) {
     const probe_response_t* p = (const probe_response_t*)data;
@@ -262,6 +299,16 @@ void espnow_tick() {
   const bool quiet = (s_lastStateMs == 0) ||
                      (now - s_lastStateMs > LINK_TIMEOUT_MS);
   if (!s_paired || quiet) {
+    // Drop the hub's encrypted peer registration before sweeping. The hub
+    // sends probe responses UNENCRYPTED — the response carries the LMK, so it
+    // cannot be encrypted with it — and ESP-NOW discards an unencrypted frame
+    // from a peer registered as encrypted, below the receive callback, with
+    // no error at either end. Without this the display could pair once and
+    // then never recover from any link loss: the hub answered every probe and
+    // the display dropped every answer, reporting "Hub not found on any
+    // channel" forever. The sensor node has carried this same fix for a while;
+    // this client was written without it.
+    dropUnicastPeers();
     s_scanning  = true;
     s_scanTried = 0;
     scanNextChannel();

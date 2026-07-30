@@ -23,6 +23,13 @@ enum link_state_t {
 
 void espnow_init();
 
+// Raw ESP-NOW frames that reached the receive callback, and the last length.
+// An encrypted-peer mismatch drops frames below the callback with no error
+// anywhere, so counting what actually arrives is the only way to tell "the
+// hub is silent" from "the hub is answering and we are discarding it".
+uint32_t espnow_rx_count();
+int      espnow_rx_last_len();
+
 // Drive probing / polling. Call from loop().
 void espnow_tick();
 
