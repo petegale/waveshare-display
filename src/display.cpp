@@ -93,6 +93,14 @@ static bool            s_haveLast = false;
 // the series with lv_chart_set_value_by_id() instead would invalidate the
 // whole chart once per point — 120 redraws to draw one line.
 static lv_coord_t s_chartPts[CHART_POINTS];
+static lv_obj_t* s_rateChart = nullptr;
+static lv_chart_series_t* s_rateSer = nullptr;
+static lv_coord_t s_ratePts[CHART_POINTS];
+static lv_obj_t* s_legend = nullptr;
+// Tank capacities in litres from the hub, 0 when unknown. Lets the rate
+// trace be litres per hour rather than percent per hour.
+static uint16_t s_tankCapacityL[2] = {0, 0};
+
 
 // Per-tile descriptor: which history metric backs it, and how to print it.
 typedef struct {
@@ -293,7 +301,7 @@ static void build_detail_screen() {
   s_chart = lv_chart_create(s_detailScr);
   lv_obj_set_size(s_chart, SCREEN_WIDTH - 100, 300);
   lv_obj_align(s_chart, LV_ALIGN_BOTTOM_MID, 10, -46);
-  lv_chart_set_type(s_chart, LV_CHART_TYPE_LINE);
+  lv_chart_set_type(s_chart, LV_CHART_TYPE_BAR);
   lv_chart_set_point_count(s_chart, CHART_POINTS);
   lv_chart_set_div_line_count(s_chart, 5, 6);
   lv_chart_set_update_mode(s_chart, LV_CHART_UPDATE_MODE_SHIFT);
@@ -306,6 +314,33 @@ static void build_detail_screen() {
   s_chartSer = lv_chart_add_series(s_chart, COL_FILL, LV_CHART_AXIS_PRIMARY_Y);
   for (int i = 0; i < CHART_POINTS; i++) s_chartPts[i] = LV_CHART_POINT_NONE;
   lv_chart_set_ext_y_array(s_chart, s_chartSer, s_chartPts);
+
+  // Rate of change rides on a second chart stacked exactly on the first.
+  // LVGL sets chart type per chart, not per series, so bars and a line cannot
+  // share one — and the two need independent Y ranges anyway: a tank's level
+  // and its litres-per-hour have nothing in common but the time axis. This is
+  // the same split Victron uses for voltage against current.
+  s_rateChart = lv_chart_create(s_detailScr);
+  lv_obj_set_size(s_rateChart, SCREEN_WIDTH - 100, 300);
+  lv_obj_align(s_rateChart, LV_ALIGN_BOTTOM_MID, 10, -46);
+  lv_chart_set_type(s_rateChart, LV_CHART_TYPE_LINE);
+  lv_chart_set_point_count(s_rateChart, CHART_POINTS);
+  lv_chart_set_div_line_count(s_rateChart, 0, 0);
+  lv_obj_set_style_bg_opa(s_rateChart, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(s_rateChart, 0, 0);
+  lv_obj_set_style_size(s_rateChart, 0, LV_PART_INDICATOR);
+  lv_obj_set_style_line_width(s_rateChart, 3, LV_PART_ITEMS);
+  lv_obj_clear_flag(s_rateChart, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+  s_rateSer = lv_chart_add_series(s_rateChart, COL_WARN, LV_CHART_AXIS_PRIMARY_Y);
+  for (int i = 0; i < CHART_POINTS; i++) s_ratePts[i] = LV_CHART_POINT_NONE;
+  lv_chart_set_ext_y_array(s_rateChart, s_rateSer, s_ratePts);
+
+  // Legend, so the two colours are not a guess.
+  s_legend = lv_label_create(s_detailScr);
+  lv_obj_set_style_text_font(s_legend, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(s_legend, COL_DIM, 0);
+  lv_obj_align(s_legend, LV_ALIGN_BOTTOM_LEFT, 20, -18);
+  lv_label_set_text(s_legend, "");
 
   s_dSpan = lv_label_create(s_detailScr);
   lv_obj_set_style_text_font(s_dSpan, &lv_font_montserrat_20, 0);
@@ -529,6 +564,54 @@ static void refresh_detail() {
     lv_chart_set_range(s_chart, LV_CHART_AXIS_PRIMARY_Y, lo - pad, hi + pad);
   }
 
+  // ── Rate of change ──────────────────────────────────────────────────────
+  // The question a tank chart is actually asked is "how fast is it going
+  // down", which the absolute trace answers only by eye. Differencing the
+  // series and scaling to per-hour answers it directly.
+  //
+  // Scaled ×10 so a tenth of a unit per hour survives the integer chart:
+  // fuel burn is often under 1 %/h and would otherwise quantise to a flat
+  // line at zero. The axis labels divide it back out.
+  const uint16_t iv = s_usingHub ? espnow_history_interval_s() : 60;
+  const float perHour = iv ? 3600.0f / (float)iv : 60.0f;
+  // Litres per hour when the hub has told us the tank's size — percent per
+  // hour cannot answer "how much fuel", which is the whole point.
+  const float toUnits = (idx < 2 && s_tankCapacityL[idx] > 0)
+                      ? (float)s_tankCapacityL[idx] / 100.0f : 1.0f;
+
+  int16_t rateLo = 0, rateHi = 0;
+  bool haveRate = false;
+  for (int i = 0; i < CHART_POINTS; i++) {
+    if (i == 0 || pts[i] == HIST_NO_DATA || pts[i - 1] == HIST_NO_DATA) {
+      s_ratePts[i] = LV_CHART_POINT_NONE;
+      continue;
+    }
+    float r = (float)(pts[i] - pts[i - 1]) * perHour * toUnits * 10.0f;
+    if (r >  3000) r =  3000;      // keep a spike from flattening everything
+    if (r < -3000) r = -3000;
+    int16_t ri = (int16_t)r;
+    s_ratePts[i] = ri;
+    if (!haveRate) { rateLo = rateHi = ri; haveRate = true; }
+    if (ri < rateLo) rateLo = ri;
+    if (ri > rateHi) rateHi = ri;
+  }
+  if (haveRate) {
+    // Symmetric about zero so "filling" and "emptying" read the same way and
+    // the zero crossing sits on a fixed line rather than wandering.
+    int16_t mag = (rateHi > -rateLo ? rateHi : -rateLo);
+    if (mag < 10) mag = 10;
+    lv_chart_set_range(s_rateChart, LV_CHART_AXIS_PRIMARY_Y, -mag, mag);
+    const char* rUnit = (idx < 2 && s_tankCapacityL[idx] > 0) ? "L/h" : "%/h";
+    char lbuf[72];
+    snprintf(lbuf, sizeof(lbuf), "#4A9EFF bars# level %%    #FFB020 line# rate %s  (max %.1f)",
+             rUnit, mag / 10.0f);
+    lv_label_set_recolor(s_legend, true);
+    lv_label_set_text(s_legend, lbuf);
+  } else {
+    lv_label_set_text(s_legend, "");
+  }
+  lv_chart_refresh(s_rateChart);
+
   // Write straight into the array LVGL is already pointing at, then
   // invalidate once.
   for (int i = 0; i < CHART_POINTS; i++) {
@@ -556,6 +639,8 @@ void display_update(const display_state_t& state) {
 
   s_last     = state;
   s_haveLast = true;
+  for (int i = 0; i < 2; i++)
+    s_tankCapacityL[i] = (i < state.n_tanks) ? state.tanks[i].capacity_l : 0;
 
   // ── Header clock ──
   if (state.utc_days == DISPLAY_UTC_DAYS_NONE) {
