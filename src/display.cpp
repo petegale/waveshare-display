@@ -30,7 +30,13 @@
 #define COL_BORDER    lv_color_hex(0x3A3D42)
 #define COL_BAR_BG    lv_color_hex(0x1C1E22)
 #define COL_TEXT      lv_color_hex(0xF2F2F2)
-#define COL_DIM       lv_color_hex(0x8A9099)
+// Neutral grey, not the tinted 0x8A9099 it used to be. On an RGB-stripe
+// panel a thin glyph lights unequal sub-pixels, and a colour that is already
+// blue-weighted turns single-pixel stems visibly red on one edge and white on
+// the other — which is exactly how the detail-page labels were rendering.
+// Equal channels keep the fringing symmetric, and the lighter value keeps it
+// legible at arm's length: ~7:1 on the black background.
+#define COL_DIM       lv_color_hex(0xB4B4B4)
 #define COL_FILL      lv_color_hex(0x4A9EFF)   // tank / healthy battery
 #define COL_WARN      lv_color_hex(0xFFB020)   // battery below the window
 #define COL_ALARM     lv_color_hex(0xFF4D4D)   // link lost
@@ -302,7 +308,7 @@ static void build_detail_screen() {
   lv_chart_set_ext_y_array(s_chart, s_chartSer, s_chartPts);
 
   s_dSpan = lv_label_create(s_detailScr);
-  lv_obj_set_style_text_font(s_dSpan, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_font(s_dSpan, &lv_font_montserrat_20, 0);
   lv_obj_set_style_text_color(s_dSpan, COL_DIM, 0);
   lv_label_set_text(s_dSpan, "");
   lv_obj_align(s_dSpan, LV_ALIGN_BOTTOM_MID, 0, -16);
@@ -405,7 +411,7 @@ void display_init() {
   const lv_coord_t frac[3] = { 0, 50, 100 };   // % down the bar area
   for (int i = 0; i < 3; i++) {
     lv_obj_t* m = lv_label_create(s_tile[2].root);
-    lv_obj_set_style_text_font(m, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(m, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(m, COL_DIM, 0);
     lv_label_set_text(m, marks[i]);
     lv_coord_t barArea = TILE_H - BAR_H - 4;

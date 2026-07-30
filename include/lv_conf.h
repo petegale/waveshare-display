@@ -22,8 +22,9 @@
 
 // Sizes actually referenced by display.cpp. Each enabled face costs
 // flash, so keep this list in sync rather than enabling the whole range.
-#define LV_FONT_MONTSERRAT_14 1
-#define LV_FONT_MONTSERRAT_16 1
+// 14 and 16 px are deliberately absent: below 20 px this panel's RGB stripe
+// turns thin stems into red/white fringing, so those faces are not available
+// to be reached for by accident.
 #define LV_FONT_MONTSERRAT_20 1
 #define LV_FONT_MONTSERRAT_24 1
 #define LV_FONT_MONTSERRAT_28 1
