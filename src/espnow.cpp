@@ -1,19 +1,21 @@
 /**
  * espnow.cpp — see header for the link model.
  *
- * Mirrors the proven sensor-display client, minus the deep-sleep power
- * management: channel probe → probe_response_t (carries the LMK) →
- * encrypted peer → periodic display_request_t.
+ * The link logic lives in protocol/espnow_client.h and is shared with every
+ * other device on the hub. This file is the executor: it performs the radio
+ * operations the state machine asks for, and feeds it events. The ordering
+ * rules that used to be duplicated (and independently broken) in each client
+ * — channel before peer, drop peers before sweeping, delete peer before
+ * forgetting the MAC — are now decided there and covered by host tests.
  *
- * Pairing (hub MAC + LMK) is persisted in NVS so a power cycle doesn't
- * need the user to re-open pairing mode on the hub. A zero LMK means the
- * hub asked for an unencrypted link (e.g. the bench simulator).
+ * What stays here is genuinely display-specific: a 5 s poll cadence, mains
+ * power, the state/history message handling, and the NVS pairing record.
  */
 
 #include "espnow.h"
 #include "config.h"
-#include "config.h"
 #include "display.h"
+#include "espnow_client.h"
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -23,14 +25,24 @@
 #include <atomic>
 #include <string.h>
 
-static uint8_t  s_hubMac[6]  = {};
-static uint8_t  s_hubLmk[16] = {};
-static bool     s_paired     = false;
-static uint8_t  s_channel    = 0;
+static espnow_client_t s_client;
 
-static std::atomic<bool> s_gotProbe{false};
 static std::atomic<bool> s_gotState{false};
 static std::atomic<bool> s_gotUnpair{false};
+
+// A probe response is handed to the state machine from the tick, not from the
+// RX callback: the callback runs on the WiFi task and the client is not
+// thread-safe. The callback only stashes and flags.
+static std::atomic<bool> s_gotProbe{false};
+static uint8_t s_probeMac[6];
+static uint8_t s_probeLmk[16];
+static uint8_t s_probeCh;
+
+// Send results, likewise drained in the tick rather than applied in the
+// callback. Consecutive failures are one of the two independent ways the
+// client notices a dead link.
+static std::atomic<uint32_t> s_txOk{0};
+static std::atomic<uint32_t> s_txFail{0};
 
 static display_state_t s_state = {};
 
@@ -49,11 +61,16 @@ static bool     s_everUp      = false;
 static void loadPairing() {
   Preferences p;
   p.begin("display", true);
-  s_paired = p.getBool("paired", false);
-  if (s_paired) {
-    p.getBytes("hubMac", s_hubMac, 6);
-    p.getBytes("hubLmk", s_hubLmk, 16);
-    s_channel = p.getUChar("chan", 0);
+  bool paired = p.getBool("paired", false);
+  if (paired) {
+    uint8_t mac[6] = {}, lmk[16] = {};
+    p.getBytes("hubMac", mac, 6);
+    p.getBytes("hubLmk", lmk, 16);
+    uint8_t ch = p.getUChar("chan", 0);
+    // Seeds which channel to sweep first and who to expect. It does not claim
+    // the link is up — that still has to be proven by a probe exchange.
+    espnow_client_restore(&s_client, mac, lmk, ch);
+    Serial.printf("Restored pairing from NVS (ch%d)\n", ch);
   }
   p.end();
 }
@@ -62,37 +79,14 @@ static void savePairing() {
   Preferences p;
   p.begin("display", false);
   p.putBool("paired", true);
-  p.putBytes("hubMac", s_hubMac, 6);
-  p.putBytes("hubLmk", s_hubLmk, 16);
-  p.putUChar("chan", s_channel);
+  p.putBytes("hubMac", s_client.hubMac, 6);
+  p.putBytes("hubLmk", s_client.hubLmk, 16);
+  p.putUChar("chan", s_client.channel);
   p.end();
 }
 
-static void clearPairing() {
-  Preferences p;
-  p.begin("display", false);
-  p.clear();
-  p.end();
-  // Delete the peer BEFORE forgetting the MAC. Zeroing s_hubMac first left
-  // the hub registered as an encrypted peer with nothing left pointing at it:
-  // unrecoverable, because every later attempt to clean it up no longer knew
-  // which address to remove. The display then discarded every unencrypted
-  // probe response the hub sent and reported "Hub not found on any channel"
-  // forever, with the hub visibly answering every probe.
-  uint8_t zero[6] = {};
-  if (memcmp(s_hubMac, zero, 6) != 0 && esp_now_is_peer_exist(s_hubMac)) {
-    esp_now_del_peer(s_hubMac);
-  }
-  s_paired  = false;
-  s_channel = 0;
-  memset(s_hubMac, 0, 6);
-  memset(s_hubLmk, 0, 16);
-}
-
-// Drop every non-broadcast peer. Used before a channel sweep: probe responses
-// arrive unencrypted, so any encrypted registration left over from a previous
-// link silently swallows them. Walking the table rather than trusting
-// s_hubMac means this still works when the stored MAC has already been lost.
+// Drop every non-broadcast peer. Walking the table rather than trusting a
+// stored MAC means this still works when the address has already been lost.
 static void dropUnicastPeers() {
   esp_now_peer_info_t info;
   static const uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
@@ -108,7 +102,7 @@ static void dropUnicastPeers() {
   for (int i = 0; i < n; i++) esp_now_del_peer(doomed[i]);
 }
 
-// ─── RX (NimBLE-free; runs on the WiFi task) ────────────────────────────────
+// ─── RX (runs on the WiFi task) ─────────────────────────────────────────────
 static volatile bool s_rxStateLog = false;
 static volatile bool s_histLog = false;
 static volatile uint32_t s_rxTotal = 0;
@@ -126,9 +120,9 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
     const probe_response_t* p = (const probe_response_t*)data;
     if (p->magic[0] != PROBE_MAGIC_0 || p->magic[1] != PROBE_MAGIC_1) return;
     if (p->type != PROBE_TYPE_RESPONSE) return;
-    memcpy(s_hubMac, info->src_addr, 6);
-    memcpy(s_hubLmk, p->lmk, 16);
-    s_channel = p->channel;
+    memcpy(s_probeMac, info->src_addr, 6);
+    memcpy(s_probeLmk, p->lmk, 16);
+    s_probeCh = p->channel;
     s_gotProbe.store(true);
     return;
   }
@@ -161,6 +155,15 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
   }
 }
 
+static void onSent(const wifi_tx_info_t* info, esp_now_send_status_t status) {
+  // Broadcast probes always "succeed" and say nothing about the link; only
+  // unicast to the hub is evidence either way.
+  static const uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+  if (!info || memcmp(info->des_addr, bcast, 6) == 0) return;
+  if (status == ESP_NOW_SEND_SUCCESS) s_txOk.fetch_add(1);
+  else                                s_txFail.fetch_add(1);
+}
+
 // ─── Peers ──────────────────────────────────────────────────────────────────
 static void setPeer(const uint8_t* mac, uint8_t ch, const uint8_t* lmk) {
   if (esp_now_is_peer_exist(mac)) esp_now_del_peer(mac);
@@ -175,59 +178,14 @@ static void setPeer(const uint8_t* mac, uint8_t ch, const uint8_t* lmk) {
   esp_now_add_peer(&peer);
 }
 
-// ─── Probe ──────────────────────────────────────────────────────────────────
-// Sweeps the channel range looking for the hub, starting at the last known
-// channel so a re-probe after a dropout is usually a single hop.
-//
-// One channel per tick rather than a blocking sweep: at 13 channels ×
-// PROBE_LISTEN_MS a blocking scan would stall lv_timer_handler() for over
-// a second every poll, freezing the UI whenever the hub is unreachable —
-// exactly when the user is most likely to be looking at it.
-static bool     s_scanning   = false;
-static int      s_scanTried  = 0;
-static uint8_t  s_scanCh     = 0;
-static uint32_t s_scanStepAt = 0;
-
-static void scanNextChannel() {
+static void sendProbe() {
   static const uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-  const int nCh = WIFI_CHANNEL_MAX - WIFI_CHANNEL_MIN + 1;
-
-  if (s_scanTried >= nCh) {           // full sweep with no answer
-    s_scanning  = false;
-    s_scanTried = 0;
-    Serial.println("Hub not found on any channel");
-    return;
-  }
-
-  s_scanCh = (s_scanTried == 0)
-             ? (s_channel ? s_channel : DEFAULT_WIFI_CHANNEL)
-             : WIFI_CHANNEL_MIN + ((s_scanCh - WIFI_CHANNEL_MIN + 1) % nCh);
-  s_scanTried++;
-
-  esp_wifi_set_channel(s_scanCh, WIFI_SECOND_CHAN_NONE);
-  setPeer(bcast, s_scanCh, nullptr);
-
   channel_probe_t pkt = {};
   pkt.magic[0] = PROBE_MAGIC_0;
   pkt.magic[1] = PROBE_MAGIC_1;
   pkt.type     = PROBE_TYPE_REQUEST;
   pkt.channel  = 0;
   esp_now_send(bcast, (const uint8_t*)&pkt, sizeof(pkt));
-
-  s_scanStepAt = millis();
-}
-
-// Called from the tick when the RX callback has flagged a probe response.
-static void lockOntoHub() {
-  esp_wifi_set_channel(s_channel, WIFI_SECOND_CHAN_NONE);
-  setPeer(s_hubMac, s_channel, s_hubLmk);
-  s_paired    = true;
-  s_scanning  = false;
-  s_scanTried = 0;
-  savePairing();
-  Serial.printf("Hub found on ch%d (%02X:%02X:%02X:%02X:%02X:%02X)\n",
-                s_channel, s_hubMac[0], s_hubMac[1], s_hubMac[2],
-                s_hubMac[3], s_hubMac[4], s_hubMac[5]);
 }
 
 static void sendRequest() {
@@ -238,7 +196,7 @@ static void sendRequest() {
   req.flags            = 0;
   req.sequence         = s_seq++;
   req.reserved         = 0;
-  esp_now_send(s_hubMac, (const uint8_t*)&req, sizeof(req));
+  esp_now_send(s_client.hubMac, (const uint8_t*)&req, sizeof(req));
 }
 
 // ─── Public ─────────────────────────────────────────────────────────────────
@@ -253,21 +211,41 @@ void espnow_init() {
   static const uint8_t pmk[16] = ESPNOW_PMK;
   esp_now_set_pmk(pmk);
   esp_now_register_recv_cb(onRecv);
+  esp_now_register_send_cb(onSent);
+
+  // Transport policy — the part that is legitimately this device's own.
+  // A mains-powered display can afford to re-probe promptly; it has no sleep
+  // budget to protect and the user is looking at it.
+  espnow_cfg_t cfg = {};
+  cfg.chMin         = WIFI_CHANNEL_MIN;
+  cfg.chMax         = WIFI_CHANNEL_MAX;
+  cfg.listenMs      = PROBE_LISTEN_MS;
+  cfg.txFailLimit   = 5;
+  cfg.linkTimeoutMs = LINK_TIMEOUT_MS;
+  espnow_client_init(&s_client, &cfg);
 
   loadPairing();
-  if (s_paired) {
-    if (s_channel) esp_wifi_set_channel(s_channel, WIFI_SECOND_CHAN_NONE);
-    setPeer(s_hubMac, s_channel, s_hubLmk);
-    Serial.printf("Restored pairing from NVS (ch%d)\n", s_channel);
-  }
 }
 
 void espnow_tick() {
   uint32_t now = millis();
+  espnow_client_set_time(&s_client, now);
+
+  // Drain the callbacks into the state machine.
+  for (uint32_t n = s_txOk.exchange(0);   n; n--) espnow_client_on_tx_result(&s_client, true);
+  for (uint32_t n = s_txFail.exchange(0); n; n--) espnow_client_on_tx_result(&s_client, false);
 
   if (s_gotUnpair.exchange(false)) {
     Serial.println("UNPAIR received — clearing pairing");
-    clearPairing();
+    Preferences p;
+    p.begin("display", false);
+    p.clear();
+    p.end();
+    s_lastStateMs = 0;
+    s_everUp      = false;
+    // The peer deletion itself is sequenced by the client, which will not let
+    // the MAC be forgotten until the registration is gone.
+    espnow_client_on_unpair(&s_client);
   }
 
   if (s_histLog) {
@@ -295,6 +273,7 @@ void espnow_tick() {
   if (s_gotState.exchange(false)) {
     s_lastStateMs = now;
     s_everUp      = true;
+    espnow_client_on_hub_frame(&s_client);
     if (s_rxStateLog) {
       s_rxStateLog = false;
       // What actually arrived, decoded on this side. The hub logs what it
@@ -313,51 +292,67 @@ void espnow_tick() {
 
   // A probe answer can land at any time — including mid-sweep.
   if (s_gotProbe.exchange(false)) {
-    lockOntoHub();
+    espnow_client_on_probe_reply(&s_client, s_probeMac, s_probeLmk, s_probeCh);
+  }
+
+  // The poll cadence is this device's own policy; everything else about when
+  // to transmit, sweep or give up belongs to the shared client.
+  const bool wantSend = (now - s_lastPollMs) >= POLL_INTERVAL_MS;
+
+  switch (espnow_client_tick(&s_client, wantSend)) {
+  case ESPNOW_ACT_DROP_PEERS:
+    dropUnicastPeers();
+    break;
+  case ESPNOW_ACT_SET_CHANNEL:
+    esp_wifi_set_channel(s_client.act_channel, WIFI_SECOND_CHAN_NONE);
+    break;
+  case ESPNOW_ACT_ADD_BCAST_PEER: {
+    static const uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    setPeer(bcast, s_client.act_channel, nullptr);
+    break;
+  }
+  case ESPNOW_ACT_SEND_PROBE:
+    sendProbe();
+    break;
+  case ESPNOW_ACT_ADD_HUB_PEER:
+    setPeer(s_client.act_mac, s_client.act_channel, s_client.act_lmk);
+    savePairing();
+    Serial.printf("Hub found on ch%d (%02X:%02X:%02X:%02X:%02X:%02X)\n",
+                  s_client.act_channel,
+                  s_client.act_mac[0], s_client.act_mac[1], s_client.act_mac[2],
+                  s_client.act_mac[3], s_client.act_mac[4], s_client.act_mac[5]);
+    // Poll immediately rather than waiting out the cadence — the user is
+    // watching a "searching" banner.
     sendRequest();
     s_lastPollMs = now;
-    return;
+    break;
+  case ESPNOW_ACT_DEL_HUB_PEER:
+    if (esp_now_is_peer_exist(s_client.act_mac))
+      esp_now_del_peer(s_client.act_mac);
+    break;
+  case ESPNOW_ACT_SEND_DATA:
+    sendRequest();
+    s_lastPollMs = now;
+    break;
+  case ESPNOW_ACT_REPORT_LOST:
+    Serial.printf("Hub not found on any channel (rx=%lu tx=%lu fail=%lu sweeps=%lu)\n",
+                  (unsigned long)s_client.rxFrames,
+                  (unsigned long)s_client.txAttempts,
+                  (unsigned long)s_client.txFailures,
+                  (unsigned long)s_client.sweeps);
+    break;
+  case ESPNOW_ACT_NONE:
+    break;
   }
-
-  // Mid-sweep: step to the next channel once this one has had its listen
-  // window, and don't poll until the sweep resolves.
-  if (s_scanning) {
-    if (now - s_scanStepAt >= PROBE_LISTEN_MS) scanNextChannel();
-    return;
-  }
-
-  if (now - s_lastPollMs < POLL_INTERVAL_MS) return;
-  s_lastPollMs = now;
-
-  // Unpaired, or the link has been quiet long enough that the hub may
-  // have hopped channels → start a sweep instead of polling into the void.
-  const bool quiet = (s_lastStateMs == 0) ||
-                     (now - s_lastStateMs > LINK_TIMEOUT_MS);
-  if (!s_paired || quiet) {
-    // Drop the hub's encrypted peer registration before sweeping. The hub
-    // sends probe responses UNENCRYPTED — the response carries the LMK, so it
-    // cannot be encrypted with it — and ESP-NOW discards an unencrypted frame
-    // from a peer registered as encrypted, below the receive callback, with
-    // no error at either end. Without this the display could pair once and
-    // then never recover from any link loss: the hub answered every probe and
-    // the display dropped every answer, reporting "Hub not found on any
-    // channel" forever. The sensor node has carried this same fix for a while;
-    // this client was written without it.
-    dropUnicastPeers();
-    s_scanning  = true;
-    s_scanTried = 0;
-    scanNextChannel();
-    return;
-  }
-
-  sendRequest();
 }
 
 link_state_t espnow_link_state() {
-  if (s_lastStateMs == 0) return LINK_SEARCHING;
-  if (millis() - s_lastStateMs > LINK_TIMEOUT_MS)
-    return s_everUp ? LINK_LOST : LINK_SEARCHING;
-  return LINK_UP;
+  // The client's own notion of "up" is about the peer registration; the banner
+  // is about whether data is arriving, which is what the user cares about.
+  if (espnow_client_link(&s_client) == ESPNOW_LINK_UP &&
+      s_lastStateMs != 0 && (millis() - s_lastStateMs) <= LINK_TIMEOUT_MS)
+    return LINK_UP;
+  return s_everUp ? LINK_LOST : LINK_SEARCHING;
 }
 
 uint32_t espnow_seconds_since_state() {
@@ -386,7 +381,7 @@ void espnow_history_request(uint8_t metricIdx, uint8_t window, uint8_t nPoints,
   req.n_points   = nPoints;
   req.sequence   = ++s_histSeq;
   req.offset_buckets = offsetBuckets;
-  esp_now_send(s_hubMac, (const uint8_t*)&req, sizeof(req));
+  esp_now_send(s_client.hubMac, (const uint8_t*)&req, sizeof(req));
 }
 
 bool espnow_history_ready() { return s_histReady; }
