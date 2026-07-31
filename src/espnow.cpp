@@ -261,12 +261,19 @@ void espnow_tick() {
   // finger tap never coincided. Costs one 7-byte frame per boot and touches
   // no UI state.
 #ifdef HIST_SELFTEST
+  // Which metric to ask for is a build flag: a hub with no tanks configured
+  // answers HIST_METRIC_TANK0 with "no such metric", so a hardcoded tank made
+  // the self-test silently untestable on exactly the bench it was meant for.
+  #ifndef HIST_SELFTEST_METRIC
+  #define HIST_SELFTEST_METRIC HIST_METRIC_TANK0
+  #endif
   static bool selfTestDone = false;
   if (!selfTestDone && s_everUp && (now - s_lastStateMs) < 10000 &&
       now > 10000) {
     selfTestDone = true;
-    Serial.println("HIST selftest: requesting tank0 / 24h");
-    espnow_history_request(HIST_METRIC_TANK0, HIST_WINDOW_24H, 120);
+    Serial.printf("HIST selftest: requesting metric %d / 24h\n",
+                  (int)HIST_SELFTEST_METRIC);
+    espnow_history_request(HIST_SELFTEST_METRIC, HIST_WINDOW_24H, 120, 0);
   }
 #endif
 
